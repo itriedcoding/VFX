@@ -8,7 +8,7 @@
 
 local Version = {}
 
-Version.VERSION = "1.0.0"
+Version.VERSION = "1.0.1"
 
 Version.REPO = "itriedcoding/VFX"
 Version.RELEASES_URL = "https://github.com/itriedcoding/VFX/releases"

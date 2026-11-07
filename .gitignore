@@ -1,0 +1,8 @@
+node_modules/
+.tools/
+tmp/
+*.log
+.DS_Store
+sourcemap.json
+# Build output: the plugin model is published, the test bundle is disposable.
+dist/harness.lua

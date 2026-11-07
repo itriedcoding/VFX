@@ -1,0 +1,10 @@
+{
+  "name": "VFXStudio",
+  "tree": {
+    "$className": "Folder",
+    "$properties": {
+      "Name": "VFXStudio"
+    },
+    "$path": "src"
+  }
+}

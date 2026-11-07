@@ -1,0 +1,13 @@
+{
+  "name": "vfx-studio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VFX Studio - a professional Roblox Studio plugin for creating, editing, previewing and managing visual effects.",
+  "scripts": {
+    "build": "node tools/build-rbxmx.js",
+    "check": "node tools/check-luau.js",
+    "test": "node tools/test.js",
+    "verify": "npm run check && npm run build && npm run test"
+  },
+  "license": "MIT"
+}

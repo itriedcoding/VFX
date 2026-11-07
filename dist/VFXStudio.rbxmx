@@ -3850,16 +3850,46 @@ local function releaseNotes(value: any): string
 	return trimmed
 end
 
-local function manifestAssetUrl(release: any): string?
-	if type(release.assets) ~= "table" then
-		return nil
-	end
-	for _, asset in ipairs(release.assets) do
-		if type(asset) == "table" and asset.name == Version.MANIFEST_ASSET and type(asset.browser_download_url) == "string" then
-			return asset.browser_download_url
-		end
+local function httpsUrl(value: any): string?
+	if type(value) == "string" and string.sub(value, 1, 8) == "https://" then
+		return value
 	end
 	return nil
+end
+
+--- Maps release asset names to their download URLs (https only).
+local function releaseAssets(release: any): { [string]: string }
+	local urls = {}
+	if type(release.assets) ~= "table" then
+		return urls
+	end
+	for _, asset in ipairs(release.assets) do
+		if type(asset) == "table" and type(asset.name) == "string" then
+			local url = httpsUrl(asset.browser_download_url)
+			if url then
+				urls[asset.name] = url
+			end
+		end
+	end
+	return urls
+end
+
+--- Where to download the published plugin file for a build. Manifests and
+--- releases carry these when they can; otherwise the stable release URLs are
+--- used, so the links always resolve for the latest published build.
+function Updater.downloadLinks(source: any?): { model: string, zip: string, page: string }
+	local block = if type(source) == "table" then source.download else nil
+	local function pick(value: any, fallback: string): string
+		return httpsUrl(value) or fallback
+	end
+	local model = if type(block) == "table" then block.model else nil
+	local zip = if type(block) == "table" then block.zip else nil
+	local page = if type(block) == "table" then block.page else nil
+	return {
+		model = pick(model, Version.MODEL_URL),
+		zip = pick(zip, Version.PLUGIN_ZIP_URL),
+		page = pick(page, Version.RELEASES_URL),
+	}
 end
 
 --- Checks for a newer build. Yields while requesting. Returns the release info.
@@ -3875,12 +3905,18 @@ function Updater:check(): any?
 		if type(release) == "table" and (release.tag_name or release.name) then
 			local version = Version.clean(release.tag_name or release.name)
 			if Version.parse(version) then
+				local assets = releaseAssets(release)
 				self.info = {
 					version = version,
 					notes = releaseNotes(release.body),
-					url = if type(release.html_url) == "string" then release.html_url else Version.RELEASES_URL,
+					url = httpsUrl(release.html_url) or Version.RELEASES_URL,
 					publishedAt = release.published_at,
-					manifestUrl = manifestAssetUrl(release) or Version.MANIFEST_URL,
+					manifestUrl = assets[Version.MANIFEST_ASSET] or Version.MANIFEST_URL,
+					download = {
+						model = assets[Version.MODEL_ASSET] or Version.MODEL_URL,
+						zip = assets[Version.PLUGIN_ZIP_ASSET] or Version.PLUGIN_ZIP_URL,
+						page = httpsUrl(release.html_url) or Version.RELEASES_URL,
+					},
 					source = "release",
 				}
 				self:markChecked(version)
@@ -3900,15 +3936,15 @@ function Updater:check(): any?
 	if fallbackBody then
 		local manifest = Format.jsonDecode(fallbackBody)
 		local valid, problem = Updater.validateManifest(manifest)
-		if valid then
-			self.info = {
-				version = Version.clean(manifest.version),
-				notes = "Build from the main branch (no tagged release yet).",
-				url = Version.RELEASES_URL,
-				publishedAt = manifest.generatedAt,
-				manifestUrl = Version.FALLBACK_MANIFEST_URL,
-				source = "main",
-			}
+		if valid then				self.info = {
+					version = Version.clean(manifest.version),
+					notes = "Build from the main branch (no tagged release yet).",
+					url = Version.RELEASES_URL,
+					publishedAt = manifest.generatedAt,
+					manifestUrl = Version.FALLBACK_MANIFEST_URL,
+					download = Updater.downloadLinks(manifest),
+					source = "main",
+				}
 			self:markChecked(self.info.version)
 			self:setState("idle", nil)
 			return self.info
@@ -4357,7 +4393,7 @@ return Util
 
 local Version = {}
 
-Version.VERSION = "1.0.1"
+Version.VERSION = "1.0.2"
 
 Version.REPO = "itriedcoding/VFX"
 Version.RELEASES_URL = "https://github.com/itriedcoding/VFX/releases"
@@ -4366,6 +4402,7 @@ Version.API_URL = "https://api.github.com/repos/itriedcoding/VFX/releases/latest
 -- Stable URL that always points at the newest published release.
 Version.MANIFEST_URL = "https://github.com/itriedcoding/VFX/releases/latest/download/manifest.json"
 Version.MODEL_URL = "https://github.com/itriedcoding/VFX/releases/latest/download/VFXStudio.rbxmx"
+Version.PLUGIN_ZIP_URL = "https://github.com/itriedcoding/VFX/releases/latest/download/VFXStudio.zip"
 
 -- Fallback used until the first GitHub release exists (and as a canary for
 -- builds that have landed on main but have not been tagged yet).
@@ -4373,6 +4410,7 @@ Version.FALLBACK_MANIFEST_URL = "https://raw.githubusercontent.com/itriedcoding/
 
 Version.MANIFEST_ASSET = "manifest.json"
 Version.MODEL_ASSET = "VFXStudio.rbxmx"
+Version.PLUGIN_ZIP_ASSET = "VFXStudio.zip"
 Version.MIN_CHECK_INTERVAL = 6 * 60 * 60
 Version.HTTP_TIMEOUT = 20
 
@@ -13902,6 +13940,36 @@ function UpdateDialog.new(parent: Instance, ctx: any)
 		end,
 	})
 
+	-- Plugin download ---------------------------------------------------------
+	Kit.caption(body, "PLUGIN DOWNLOAD", {
+		Size = UDim2.new(1, 0, 0, 14),
+		Font = Theme.font.bold,
+		TextSize = Theme.text.tiny,
+		TextColor3 = Theme.color.textMuted,
+	})
+
+	self.zipBox = Kit.textBox(body, Version.PLUGIN_ZIP_URL, {
+		size = UDim2.new(1, 0, 0, 26),
+		font = Theme.font.mono,
+		textSize = Theme.text.tiny,
+	})
+	self.zipBox.TextEditable = true
+
+	self.modelBox = Kit.textBox(body, Version.MODEL_URL, {
+		size = UDim2.new(1, 0, 0, 26),
+		font = Theme.font.mono,
+		textSize = Theme.text.tiny,
+	})
+	self.modelBox.TextEditable = true
+
+	Kit.caption(body, "Update now swaps the editor running in this session for the release build. The links above are the same build packed for a fresh install: the .zip holds VFXStudio.rbxmx plus install notes. Select a link and copy it into a browser.", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		TextSize = Theme.text.tiny,
+		TextColor3 = Theme.color.textMuted,
+	})
+
 	-- Auto-check ---------------------------------------------------------------
 	local autoRow = Kit.hlist(body, 8, {
 		Size = UDim2.new(1, 0, 0, 22),
@@ -14004,6 +14072,11 @@ function UpdateDialog:refresh()
 	self.installedLabel.Text = "Installed  " .. installed
 
 	local info = updater.info
+	local links = if info then info.download else nil
+	if self.zipBox then
+		self.zipBox.Text = (links and links.zip) or Version.PLUGIN_ZIP_URL
+		self.modelBox.Text = (links and links.model) or Version.MODEL_URL
+	end
 	if info then
 		local newer = updater:hasUpdate()
 		self.latestLabel.Text = string.format(

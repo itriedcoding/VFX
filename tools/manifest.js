@@ -37,6 +37,15 @@ function versionFromLua() {
   return match[1];
 }
 
+/** Reads a string constant out of Version.lua so the manifest cannot drift. */
+function constantFromLua(name) {
+  const source = fs.readFileSync(path.join(SRC, "Core", "Version.lua"), "utf8");
+  const pattern = new RegExp(name.replace(/\./g, "\\.") + '\\s*=\\s*"([^"]+)"');
+  const match = source.match(pattern);
+  if (!match) fail(`could not read ${name} from src/Core/Version.lua`);
+  return match[1];
+}
+
 function walk(dir, out = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
     if (entry.name.startsWith(".")) continue;
@@ -93,6 +102,13 @@ fs.writeFileSync(
     {
       version: luaVersion,
       generatedAt: new Date().toISOString(),
+      // The published plugin file for this build, so the in-Studio panel can
+      // point at a download that does not depend on the release asset names.
+      download: {
+        model: constantFromLua("Version.MODEL_URL"),
+        zip: constantFromLua("Version.PLUGIN_ZIP_URL"),
+        page: constantFromLua("Version.RELEASES_URL"),
+      },
       files,
     },
     null,

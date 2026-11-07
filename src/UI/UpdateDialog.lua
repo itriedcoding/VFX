@@ -116,6 +116,36 @@ function UpdateDialog.new(parent: Instance, ctx: any)
 		end,
 	})
 
+	-- Plugin download ---------------------------------------------------------
+	Kit.caption(body, "PLUGIN DOWNLOAD", {
+		Size = UDim2.new(1, 0, 0, 14),
+		Font = Theme.font.bold,
+		TextSize = Theme.text.tiny,
+		TextColor3 = Theme.color.textMuted,
+	})
+
+	self.zipBox = Kit.textBox(body, Version.PLUGIN_ZIP_URL, {
+		size = UDim2.new(1, 0, 0, 26),
+		font = Theme.font.mono,
+		textSize = Theme.text.tiny,
+	})
+	self.zipBox.TextEditable = true
+
+	self.modelBox = Kit.textBox(body, Version.MODEL_URL, {
+		size = UDim2.new(1, 0, 0, 26),
+		font = Theme.font.mono,
+		textSize = Theme.text.tiny,
+	})
+	self.modelBox.TextEditable = true
+
+	Kit.caption(body, "Update now swaps the editor running in this session for the release build. The links above are the same build packed for a fresh install: the .zip holds VFXStudio.rbxmx plus install notes. Select a link and copy it into a browser.", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		TextSize = Theme.text.tiny,
+		TextColor3 = Theme.color.textMuted,
+	})
+
 	-- Auto-check ---------------------------------------------------------------
 	local autoRow = Kit.hlist(body, 8, {
 		Size = UDim2.new(1, 0, 0, 22),
@@ -218,6 +248,11 @@ function UpdateDialog:refresh()
 	self.installedLabel.Text = "Installed  " .. installed
 
 	local info = updater.info
+	local links = if info then info.download else nil
+	if self.zipBox then
+		self.zipBox.Text = (links and links.zip) or Version.PLUGIN_ZIP_URL
+		self.modelBox.Text = (links and links.model) or Version.MODEL_URL
+	end
 	if info then
 		local newer = updater:hasUpdate()
 		self.latestLabel.Text = string.format(

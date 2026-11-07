@@ -8,7 +8,7 @@
 
 local Version = {}
 
-Version.VERSION = "1.0.1"
+Version.VERSION = "1.0.2"
 
 Version.REPO = "itriedcoding/VFX"
 Version.RELEASES_URL = "https://github.com/itriedcoding/VFX/releases"
@@ -17,6 +17,7 @@ Version.API_URL = "https://api.github.com/repos/itriedcoding/VFX/releases/latest
 -- Stable URL that always points at the newest published release.
 Version.MANIFEST_URL = "https://github.com/itriedcoding/VFX/releases/latest/download/manifest.json"
 Version.MODEL_URL = "https://github.com/itriedcoding/VFX/releases/latest/download/VFXStudio.rbxmx"
+Version.PLUGIN_ZIP_URL = "https://github.com/itriedcoding/VFX/releases/latest/download/VFXStudio.zip"
 
 -- Fallback used until the first GitHub release exists (and as a canary for
 -- builds that have landed on main but have not been tagged yet).
@@ -24,6 +25,7 @@ Version.FALLBACK_MANIFEST_URL = "https://raw.githubusercontent.com/itriedcoding/
 
 Version.MANIFEST_ASSET = "manifest.json"
 Version.MODEL_ASSET = "VFXStudio.rbxmx"
+Version.PLUGIN_ZIP_ASSET = "VFXStudio.zip"
 Version.MIN_CHECK_INTERVAL = 6 * 60 * 60
 Version.HTTP_TIMEOUT = 20
 

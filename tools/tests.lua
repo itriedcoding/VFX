@@ -297,7 +297,7 @@ checkEqual(updater.appliedVersion, "1.0.1", "applied version is recorded")
 check(pluginRoot:FindFirstChild("Core__previous") == nil, "old folders are removed after a good update")
 
 local broken = {
-	version = "1.0.2",
+	version = newerVersion,
 	files = {
 		stubFile("Core/Version", "Version", "return {}"),
 		stubFile("Presets/init", "Presets", "return {}"),
@@ -318,15 +318,36 @@ MOCK_HTTP.responses[Version.API_URL] = {
 		tag_name = "v1.0.1",
 		body = "Fixed things.",
 		html_url = "https://example.com/release",
-		assets = { { name = "manifest.json", browser_download_url = "https://example.com/manifest.json" } },
+		assets = {
+			{ name = "manifest.json", browser_download_url = "https://example.com/manifest.json" },
+			{ name = "VFXStudio.rbxmx", browser_download_url = "https://example.com/VFXStudio.rbxmx" },
+			{ name = "VFXStudio.zip", browser_download_url = "https://example.com/VFXStudio.zip" },
+			{ name = "notes.md", browser_download_url = "http://insecure.example.com/notes.md" },
+		},
 	}),
 }
 local info = updater:check()
 check(info ~= nil, "check returns release info")
 checkEqual(info.version, "1.0.1", "check reads the release tag")
 checkEqual(info.manifestUrl, "https://example.com/manifest.json", "check finds the manifest asset")
+checkEqual(info.download.zip, "https://example.com/VFXStudio.zip", "check finds the plugin zip asset")
+checkEqual(info.download.model, "https://example.com/VFXStudio.rbxmx", "check finds the plugin model asset")
+checkEqual(info.download.page, "https://example.com/release", "check links the release page")
 check(updater:hasUpdate() == false, "the applied version is not offered again")
 check(not updater:shouldAutoCheck(), "automatic checks are throttled after one check")
+
+checkEqual(Updater.downloadLinks(nil).model, Version.MODEL_URL, "download links fall back to the stable release URLs")
+checkEqual(Updater.downloadLinks(nil).zip, Version.PLUGIN_ZIP_URL, "the plugin zip has a stable release URL")
+checkEqual(
+	Updater.downloadLinks({ download = { zip = "http://insecure.example.com/z.zip" } }).zip,
+	Version.PLUGIN_ZIP_URL,
+	"non-https download links are ignored"
+)
+checkEqual(
+	Updater.downloadLinks({ download = { model = "https://example.com/custom.rbxmx" } }).model,
+	"https://example.com/custom.rbxmx",
+	"a manifest can override the download link"
+)
 
 MOCK_HTTP.responses["https://example.com/manifest.json"] = { Success = true, StatusCode = 200, Body = MOCK_JSON_ENCODE(manifest) }
 local downloaded, downloadError = updater:downloadManifest()
@@ -345,13 +366,39 @@ check(updater.tempHolder ~= nil, "saveToDisk builds a temporary model")
 updater:cleanupTemp()
 check(updater.tempHolder == nil, "the temporary model is cleaned up")
 
+local newerVersion = string.gsub(Version.VERSION, "(%d+)%.(%d+)%.(%d+)", function(major, minor, patch)
+	return major .. "." .. minor .. "." .. tostring(tonumber(patch) + 1)
+end)
+
+MOCK_HTTP.responses = {}
+MOCK_HTTP.responses[Version.API_URL] = { Success = false, StatusCode = 404, Body = "" }
+MOCK_HTTP.responses[Version.FALLBACK_MANIFEST_URL] = {
+	Success = true,
+	StatusCode = 200,
+	Body = MOCK_JSON_ENCODE({
+		version = newerVersion,
+		download = {
+			zip = "https://example.com/build.zip",
+			model = "https://example.com/build.rbxmx",
+			page = "https://example.com/releases",
+		},
+		files = manifest.files,
+	}),
+}
+local fallback = Updater.new(fakeUpdatePlugin, pluginRoot)
+local fallbackInfo = fallback:check()
+check(fallbackInfo ~= nil and fallbackInfo.source == "main", "with no release the main manifest is used")
+checkEqual(fallbackInfo.download.zip, "https://example.com/build.zip", "the main manifest advertises its own zip")
+checkEqual(fallbackInfo.download.page, "https://example.com/releases", "the main manifest advertises its release page")
+check(fallback:hasUpdate(), "a newer main build is offered as an update")
+
 MOCK_HTTP.responses = {}
 local offline = Updater.new(fakeUpdatePlugin, pluginRoot)
 local offlineInfo = offline:check()
 check(offlineInfo == nil, "an offline check returns nothing")
 checkEqual(offline.state, "error", "an offline check reports an error state")
 check(type(offline.lastError) == "string" and #offline.lastError > 10, "the offline error is human readable")
-print("  manifest validation, hot swap, rollback, save and offline handling verified")
+print("  manifest validation, download links, hot swap, rollback, save and offline handling verified")
 
 section("warnings")
 checkEqual(#warnings, 0, "engine warnings: " .. table.concat(warnings, " | "))

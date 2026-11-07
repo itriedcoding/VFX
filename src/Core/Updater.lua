@@ -294,16 +294,46 @@ local function releaseNotes(value: any): string
 	return trimmed
 end
 
-local function manifestAssetUrl(release: any): string?
-	if type(release.assets) ~= "table" then
-		return nil
-	end
-	for _, asset in ipairs(release.assets) do
-		if type(asset) == "table" and asset.name == Version.MANIFEST_ASSET and type(asset.browser_download_url) == "string" then
-			return asset.browser_download_url
-		end
+local function httpsUrl(value: any): string?
+	if type(value) == "string" and string.sub(value, 1, 8) == "https://" then
+		return value
 	end
 	return nil
+end
+
+--- Maps release asset names to their download URLs (https only).
+local function releaseAssets(release: any): { [string]: string }
+	local urls = {}
+	if type(release.assets) ~= "table" then
+		return urls
+	end
+	for _, asset in ipairs(release.assets) do
+		if type(asset) == "table" and type(asset.name) == "string" then
+			local url = httpsUrl(asset.browser_download_url)
+			if url then
+				urls[asset.name] = url
+			end
+		end
+	end
+	return urls
+end
+
+--- Where to download the published plugin file for a build. Manifests and
+--- releases carry these when they can; otherwise the stable release URLs are
+--- used, so the links always resolve for the latest published build.
+function Updater.downloadLinks(source: any?): { model: string, zip: string, page: string }
+	local block = if type(source) == "table" then source.download else nil
+	local function pick(value: any, fallback: string): string
+		return httpsUrl(value) or fallback
+	end
+	local model = if type(block) == "table" then block.model else nil
+	local zip = if type(block) == "table" then block.zip else nil
+	local page = if type(block) == "table" then block.page else nil
+	return {
+		model = pick(model, Version.MODEL_URL),
+		zip = pick(zip, Version.PLUGIN_ZIP_URL),
+		page = pick(page, Version.RELEASES_URL),
+	}
 end
 
 --- Checks for a newer build. Yields while requesting. Returns the release info.
@@ -319,12 +349,18 @@ function Updater:check(): any?
 		if type(release) == "table" and (release.tag_name or release.name) then
 			local version = Version.clean(release.tag_name or release.name)
 			if Version.parse(version) then
+				local assets = releaseAssets(release)
 				self.info = {
 					version = version,
 					notes = releaseNotes(release.body),
-					url = if type(release.html_url) == "string" then release.html_url else Version.RELEASES_URL,
+					url = httpsUrl(release.html_url) or Version.RELEASES_URL,
 					publishedAt = release.published_at,
-					manifestUrl = manifestAssetUrl(release) or Version.MANIFEST_URL,
+					manifestUrl = assets[Version.MANIFEST_ASSET] or Version.MANIFEST_URL,
+					download = {
+						model = assets[Version.MODEL_ASSET] or Version.MODEL_URL,
+						zip = assets[Version.PLUGIN_ZIP_ASSET] or Version.PLUGIN_ZIP_URL,
+						page = httpsUrl(release.html_url) or Version.RELEASES_URL,
+					},
 					source = "release",
 				}
 				self:markChecked(version)
@@ -344,15 +380,15 @@ function Updater:check(): any?
 	if fallbackBody then
 		local manifest = Format.jsonDecode(fallbackBody)
 		local valid, problem = Updater.validateManifest(manifest)
-		if valid then
-			self.info = {
-				version = Version.clean(manifest.version),
-				notes = "Build from the main branch (no tagged release yet).",
-				url = Version.RELEASES_URL,
-				publishedAt = manifest.generatedAt,
-				manifestUrl = Version.FALLBACK_MANIFEST_URL,
-				source = "main",
-			}
+		if valid then				self.info = {
+					version = Version.clean(manifest.version),
+					notes = "Build from the main branch (no tagged release yet).",
+					url = Version.RELEASES_URL,
+					publishedAt = manifest.generatedAt,
+					manifestUrl = Version.FALLBACK_MANIFEST_URL,
+					download = Updater.downloadLinks(manifest),
+					source = "main",
+				}
 			self:markChecked(self.info.version)
 			self:setState("idle", nil)
 			return self.info

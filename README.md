@@ -8,7 +8,13 @@ Everything the plugin advertises is implemented with real Roblox instances and r
 
 ## Install
 
-The built plugin model is committed at [`dist/VFXStudio.rbxmx`](dist/VFXStudio.rbxmx).
+The built plugin model is committed at [`dist/VFXStudio.rbxmx`](dist/VFXStudio.rbxmx), and every release also ships it inside [`VFXStudio.zip`](https://github.com/itriedcoding/VFX/releases/latest/download/VFXStudio.zip) together with install notes.
+
+**From the latest release (no build step)**
+
+1. Download [`VFXStudio.zip`](https://github.com/itriedcoding/VFX/releases/latest/download/VFXStudio.zip) (or the bare [`VFXStudio.rbxmx`](https://github.com/itriedcoding/VFX/releases/latest/download/VFXStudio.rbxmx)).
+2. Unzip it and copy `VFXStudio.rbxmx` into your Plugins folder (step 1 below).
+3. Restart Studio and click **VFX Studio** in the Plugins tab.
 
 **Local plugin (recommended)**
 
@@ -54,6 +60,7 @@ VFX Studio updates itself from GitHub without leaving Studio. The version chip i
 - **Check for updates** reads the latest GitHub release, shows the tag, publication source and release notes. Before the first tagged release exists it falls back to the manifest published from `main`, so the flow works from day one.
 - **Update now** downloads `manifest.json` from the release, validates it strictly (version, file count, total size, per-file size, allowed classes, safe paths, required folders), then hot-swaps the running plugin's `Core`, `Presets` and `UI` modules and rebuilds the editor against them — no Studio restart. The new build is loaded and verified before the old folders are deleted; any failure rolls the swap back and leaves the previous version running.
 - **Save plugin file** opens Studio's own save dialog with the rebuilt model and the suggested name `VFXStudio.rbxmx`. Studio has no API that writes plugin files, so this is the one manual step to make the update survive a restart: choose your Plugins folder and overwrite the old file.
+- **Plugin download** shows the `.zip` and `.rbxmx` links for the build the panel resolved, taken from that release's own assets when it is a release and from the manifest otherwise. Selecting a link copies it, for a fresh install on another machine without going through Studio at all.
 
 Studio asks for HTTP permission the first time the plugin contacts `github.com`. Nothing else is sent anywhere: the updater only reads the release and manifest URLs in [`src/Core/Version.lua`](src/Core/Version.lua), with no telemetry or identifiers. `HttpEnabled` does not need to be enabled — plugin HTTP permissions are separate.
 
@@ -154,6 +161,7 @@ src/
     UpdateDialog            in-Studio updater UI
 tools/
   build-rbxmx.js            packs src/ into dist/VFXStudio.rbxmx
+  package.js                zips the model + install notes into dist/VFXStudio.zip
   manifest.js               emits dist/manifest.json for the updater
   check-luau.js             compiles every source file
   mock.lua + tests.lua      mock Roblox API + the 5,276-check suite
@@ -177,7 +185,7 @@ Design notes:
 
 ```bash
 npm run check    # luau-compile every file in src/
-npm run build    # dist/manifest.json + dist/VFXStudio.rbxmx
+npm run build    # dist/manifest.json + dist/VFXStudio.rbxmx + dist/VFXStudio.zip
 npm run manifest # dist/manifest.json only
 npm run test     # headless verification harness
 npm run verify   # all three
@@ -199,7 +207,7 @@ git tag v1.0.1
 git push origin main --tags
 ```
 
-The `Release` workflow installs Luau, runs `npm run verify`, checks that the tag matches `Version.lua`, and publishes a GitHub release with `VFXStudio.rbxmx` and `manifest.json` attached. That release is what every installed plugin sees on its next update check.
+The `Release` workflow installs Luau, runs `npm run verify` (which also builds and self-checks the zip), checks that the tag matches `Version.lua`, and publishes a GitHub release with `VFXStudio.rbxmx`, `VFXStudio.zip` and `manifest.json` attached. That release is what every installed plugin sees on its next update check.
 
 ### Confirming the update check sees a release
 
@@ -233,7 +241,7 @@ The exit status is non-zero on any mismatch, so it works in CI. Before the first
 
 `check` and `test` look for `luau` / `luau-compile` on `PATH`, then `/tmp/luau`, then `tools/bin`. Point `LUAU_BIN` at the folder containing them to override. Binaries: [luau-lang/luau releases](https://github.com/luau-lang/luau/releases) (`luau-ubuntu.zip`).
 
-The harness embeds every module into one Luau program and provides a mock Roblox API whose instances **reject writes to properties that do not exist on that class** — the check that keeps the compiler honest. It verifies 5,276 assertions:
+The harness embeds every module into one Luau program and provides a mock Roblox API whose instances **reject writes to properties that do not exist on that class** — the check that keeps the compiler honest. It verifies 5,287 assertions:
 
 - 324 presets load with zero validation errors, unique ids, unique names, non-empty tags and descriptions
 - every preset compiles to the expected instance count and round-trips through the `VFXSpec` attribute
@@ -245,7 +253,7 @@ The harness embeds every module into one Luau program and provides a mock Roblox
 - the updater hot-swaps a fake plugin tree, loads the new module, rolls back a build that fails to load, throttles automatic checks, saves a plugin model and reports offline checks as human-readable errors
 - zero engine-level warnings during the entire run
 
-Latest run: `41 Luau files compiled cleanly`, `41 modules / 535.6 KiB manifest`, `324 presets (1001 components) with zero property errors`, `5276 checks passed, 0 failures`.
+Latest run: `41 Luau files compiled cleanly`, `41 modules / 538.3 KiB manifest`, `324 presets (1001 components) with zero property errors`, `5287 checks passed, 0 failures`.
 
 ---
 

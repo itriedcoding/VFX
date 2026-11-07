@@ -4,7 +4,8 @@
  *
  * Bundles the real modules into one Luau program (sources are embedded and
  * `require(script.Parent.X)` resolves through a mocked instance tree), then
- * executes tools/harness.lua with the standalone Luau interpreter.
+ * executes tools/mock.lua followed by tools/tests.lua with the standalone Luau
+ * interpreter. The generated bundle lands in dist/harness.lua (git-ignored).
  */
 "use strict";
 
@@ -14,7 +15,8 @@ const { spawnSync } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "..");
 const SRC = path.join(ROOT, "src");
-const HARNESS = path.join(ROOT, "tools", "harness.lua");
+const MOCK = path.join(ROOT, "tools", "mock.lua");
+const TESTS = path.join(ROOT, "tools", "tests.lua");
 const OUT_DIR = path.join(ROOT, "dist");
 const BUNDLE = path.join(OUT_DIR, "harness.lua");
 
@@ -91,9 +93,9 @@ function buildBundle() {
     );
   }
 
-  const harness = fs.readFileSync(HARNESS, "utf8");
+  const support = fs.readFileSync(MOCK, "utf8") + "\n" + fs.readFileSync(TESTS, "utf8");
   fs.mkdirSync(OUT_DIR, { recursive: true });
-  fs.writeFileSync(BUNDLE, `local FILES = {\n${entries.join("\n")}\n}\n\n${harness}`, "utf8");
+  fs.writeFileSync(BUNDLE, `local FILES = {\n${entries.join("\n")}\n}\n\n${support}`, "utf8");
   return BUNDLE;
 }
 

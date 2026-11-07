@@ -156,7 +156,10 @@ tools/
   build-rbxmx.js            packs src/ into dist/VFXStudio.rbxmx
   manifest.js               emits dist/manifest.json for the updater
   check-luau.js             compiles every source file
-  test.js + harness.lua     headless mock-Roblox test suite
+  mock.lua + tests.lua      mock Roblox API + the 5,276-check suite
+  test.js                   bundles src/ + mock.lua + tests.lua and runs them
+  live.lua                  drives the real Updater against injected HTTP
+  release-check.js          fetches the live release/manifest and asserts the result
 .github/workflows/release.yml
                             builds, verifies and attaches both release assets
 ```
@@ -178,6 +181,9 @@ npm run build    # dist/manifest.json + dist/VFXStudio.rbxmx
 npm run manifest # dist/manifest.json only
 npm run test     # headless verification harness
 npm run verify   # all three
+npm run release:check                                  # what an installed plugin sees right now
+npm run release:check -- --require-release             # must resolve from a GitHub release
+npm run release:check -- --expect-version 1.0.1 --expect-update
 ```
 
 ### Publishing a release
@@ -194,6 +200,36 @@ git push origin main --tags
 ```
 
 The `Release` workflow installs Luau, runs `npm run verify`, checks that the tag matches `Version.lua`, and publishes a GitHub release with `VFXStudio.rbxmx` and `manifest.json` attached. That release is what every installed plugin sees on its next update check.
+
+### Confirming the update check sees a release
+
+`npm run release:check` fetches the same two URLs the plugin fetches — `api.github.com/repos/itriedcoding/VFX/releases/latest`, then the `dist/manifest.json` fallback on `main` — and feeds those exact responses into the real `src/Core/Updater.lua` through the mock harness. It prints what the in-Studio panel would display, so you can prove the pipeline end to end without opening Studio:
+
+```console
+release:check: installed build 1.0.0
+  GET https://api.github.com/repos/itriedcoding/VFX/releases/latest
+    -> HTTP 404
+  GET https://raw.githubusercontent.com/itriedcoding/VFX/main/dist/manifest.json
+    -> HTTP 200
+
+What the in-Studio update panel shows:
+  installed:  v1.0.0
+  latest:     v1.0.0 (main)
+  update:     up to date
+  manifest:   https://raw.githubusercontent.com/itriedcoding/VFX/main/dist/manifest.json
+
+release:check: OK
+```
+
+`(main)` means the panel resolved through the fallback because no release existed yet; after the first tag publishes it reads `(release)` with the tag as `latest`. Run it with flags to make that a gate rather than a report:
+
+| Flag | Passes only when |
+| --- | --- |
+| `--require-release` | the version came from a published GitHub release, not the `main` fallback |
+| `--expect-version 1.0.1` | the resolved latest version equals that number (leading `v` optional) |
+| `--expect-update` | an installed build older than the release reports an update is available |
+
+The exit status is non-zero on any mismatch, so it works in CI. Before the first release it correctly fails with `expected a published GitHub release, but the check used 'main'`.
 
 `check` and `test` look for `luau` / `luau-compile` on `PATH`, then `/tmp/luau`, then `tools/bin`. Point `LUAU_BIN` at the folder containing them to override. Binaries: [luau-lang/luau releases](https://github.com/luau-lang/luau/releases) (`luau-ubuntu.zip`).
 

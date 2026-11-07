@@ -7,6 +7,7 @@
     "build": "node tools/manifest.js && node tools/build-rbxmx.js",
     "check": "node tools/check-luau.js",
     "manifest": "node tools/manifest.js",
+    "release:check": "node tools/release-check.js",
     "test": "node tools/test.js",
     "verify": "npm run check && npm run build && npm run test"
   },

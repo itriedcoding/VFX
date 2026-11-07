@@ -6,3 +6,4 @@ tmp/
 sourcemap.json
 # Build output: the plugin model is published, the test bundle is disposable.
 dist/harness.lua
+dist/live-check.lua

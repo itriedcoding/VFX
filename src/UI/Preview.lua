@@ -280,8 +280,7 @@ function Preview.new(parent: Instance, ctx: any)
 		if value and self.player and not self.player:IsPlaying() then
 			self:play()
 		end
-	end)
-	Kit.tooltip(loopToggle :: any, "Loop the effect")
+	end, "Loop the effect")
 	self.loopToggle = loopToggle
 
 	Kit.label(controls, "Loop", {

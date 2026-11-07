@@ -70,6 +70,28 @@ local COMPONENT_DEFAULTS = {
 	end,
 }
 
+--- Colour is stored as { {time, "#rrggbb"}, ... } everywhere in the editor.
+--- Some component defaults and imported specs use a single hex string, which
+--- the gradient editor cannot read, so it is widened here once.
+local function normalizeColor(value: any): any
+	if type(value) == "string" then
+		return { { 0, value }, { 1, value } }
+	end
+	if type(value) == "table" then
+		if #value == 0 then
+			return { { 0, "#ffffff" }, { 1, "#ffffff" } }
+		end
+		if type(value[1]) == "string" then
+			local points = {}
+			for index, hex in ipairs(value) do
+				points[index] = { (index - 1) / math.max(1, #value - 1), hex }
+			end
+			return points
+		end
+	end
+	return value
+end
+
 --- Fills in any missing field on a custom/imported component so the inspector
 --- can always render it, without discarding values a newer version added.
 function Store.normalizeComponent(comp: any): any
@@ -86,6 +108,9 @@ function Store.normalizeComponent(comp: any): any
 		base[key] = value
 	end
 	base.kind = kind
+	if base.color ~= nil then
+		base.color = normalizeColor(base.color)
+	end
 	return base
 end
 

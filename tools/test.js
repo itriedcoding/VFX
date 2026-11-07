@@ -16,6 +16,7 @@ const { spawnSync } = require("child_process");
 const ROOT = path.resolve(__dirname, "..");
 const SRC = path.join(ROOT, "src");
 const MOCK = path.join(ROOT, "tools", "mock.lua");
+const API = path.join(ROOT, "tools", "api-props.lua");
 const TESTS = path.join(ROOT, "tools", "tests.lua");
 const OUT_DIR = path.join(ROOT, "dist");
 const BUNDLE = path.join(OUT_DIR, "harness.lua");
@@ -51,6 +52,15 @@ const ORDER = [
 	"Core/Store",
 	"Core/Version",
 	"Core/Updater",
+	"UI/Kit",
+	"UI/AssetsPanel",
+	"UI/ExportDialog",
+	"UI/UpdateDialog",
+	"UI/Library",
+	"UI/Preview",
+	"UI/Timeline",
+	"UI/Inspector",
+	"UI/App",
 ];
 
 function findInterpreter() {
@@ -93,7 +103,14 @@ function buildBundle() {
     );
   }
 
-  const support = fs.readFileSync(MOCK, "utf8") + "\n" + fs.readFileSync(TESTS, "utf8");
+  if (!fs.existsSync(API)) {
+    console.error("test: missing tools/api-props.lua - run `node tools/api-dump.js`");
+    process.exit(1);
+  }
+  const support =
+    fs.readFileSync(API, "utf8") + "\n" +
+    fs.readFileSync(MOCK, "utf8") + "\n" +
+    fs.readFileSync(TESTS, "utf8");
   fs.mkdirSync(OUT_DIR, { recursive: true });
   fs.writeFileSync(BUNDLE, `local FILES = {\n${entries.join("\n")}\n}\n\n${support}`, "utf8");
   return BUNDLE;

@@ -403,5 +403,128 @@ print("  manifest validation, download links, hot swap, rollback, save and offli
 section("warnings")
 checkEqual(#warnings, 0, "engine warnings: " .. table.concat(warnings, " | "))
 
+section("editor ui")
+
+local uiSettings = {}
+local widgetNode = makeNode("VFX Studio", "DockWidgetPluginGui", nil)
+widgetNode.Enabled = true
+widgetNode.Title = "VFX Studio"
+
+local uiPlugin = {
+	GetSetting = function(_, key)
+		return uiSettings[key]
+	end,
+	SetSetting = function(_, key, value)
+		uiSettings[key] = value
+	end,
+	PromptSaveSelection = function() end,
+	Unloading = {
+		Connect = function()
+			return { Disconnect = function() end }
+		end,
+	},
+}
+
+local App = require(root.UI.App)
+local warningsBefore = #warnings
+local okApp, app = pcall(App.new, uiPlugin, widgetNode, root, function() end)
+check(okApp, "the editor shell must construct in a plugin: " .. tostring(app))
+if okApp and app then
+	check(app.root ~= nil and #app.root:GetChildren() > 0, "the editor built a root frame with content")
+	check(app.library ~= nil, "the preset library panel built")
+	for index = warningsBefore + 1, #warnings do
+		print("  panel warning: " .. tostring(warnings[index]))
+	end
+	check(app.preview ~= nil, "the live preview built")
+	check(app.timeline ~= nil, "the timeline built")
+	check(app.inspector ~= nil, "the inspector built")
+	check(app.store ~= nil and app.updater ~= nil, "store and updater are owned by the shell")
+	check(#warnings == warningsBefore, "no panel failed to build: " .. tostring(warnings[#warnings]))
+
+	app.store:applyPreset(Presets.all[1], "Smoke test")
+	check(#app.store:working().components > 0, "applying a preset gives the editor components")
+	app:refreshLayout()
+	app:updateStatus()
+	app:toast("Smoke test toast", "info")
+
+	app:openExportDialog()
+	check(app.modalContent ~= nil, "the export dialog opened")
+	app:closeModal()
+	app:openAssetPicker(nil)
+	check(app.modalContent ~= nil, "the asset panel opened")
+	app:closeModal()
+	app:openUpdateDialog()
+	check(app.modalContent ~= nil, "the update panel opened")
+	app:closeModal()
+	app:promptSavePreset()
+	check(app.modalCard ~= nil and app.modalLayer.Visible == true, "the save-preset prompt opened")
+	app:closeModal()
+	check(app.modalLayer.Visible == false, "closing a modal hides the modal layer")
+
+	-- Interactions, not just construction: every panel runs its real code path.
+	app.store:select(2)
+	app.store:setField(1, "rate", 12)
+	app.store:setField(1, "color", "#FF8800")
+	app.store:duplicateComponent(1)
+	app.store:moveComponent(1, 2)
+	app.store:undo()
+	app.store:redo()
+	app.store:removeComponent(#app.store:working().components)
+	check(#app.store:working().components > 0, "component edits leave a usable effect")
+
+	app.preview:togglePlay()
+	app.preview:togglePlay()
+	app.preview:restart()
+	app.preview:setSpeed(2)
+	app.preview:setBackground("studio")
+	app.preview:frameCamera()
+	app.preview:zoom(1.1)
+	check(app.preview:progress() >= 0, "playback reports progress")
+
+	local RunService = game:GetService("RunService")
+	for _ = 1, 120 do
+		RunService.Heartbeat:Fire(1 / 60)
+	end
+
+	app.timeline:refresh()
+	app.timeline:setProgress(0.5, 1)
+	app.inspector:showTab("curves")
+	app.inspector:showTab("cost")
+	app.inspector:showTab("properties")
+	app.inspector:rebuild()
+	app.library:setQuery("fire")
+	app.library:refresh()
+	app.library:setQuery("")
+	app.library:refresh()
+
+	app:openAssetPicker(nil)
+	if app.modalContent then
+		app.modalContent:render()
+		check(#app.modalContent:visibleAssets() > 0, "the asset panel lists textures")
+	end
+	app:closeModal()
+
+	app:openExportDialog()
+	if app.modalContent then
+		app.modalContent:render()
+	end
+	app:closeModal()
+
+	app:openUpdateDialog()
+	if app.modalContent then
+		app.modalContent:refresh()
+	end
+	app:closeModal()
+
+	for index = warningsBefore + 1, #warnings do
+		print("  ui warning: " .. tostring(warnings[index]))
+	end
+	check(#warnings == warningsBefore, "no UI interaction warned")
+
+	app:destroy()
+	check(#widgetNode:GetChildren() == 0, "closing the editor removes its widget contents")
+end
+
 print(string.format("\n%d checks passed, 0 failures", checks))
+
 print("HARNESS OK")

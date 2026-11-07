@@ -2881,6 +2881,28 @@ local COMPONENT_DEFAULTS = {
 	end,
 }
 
+--- Colour is stored as { {time, "#rrggbb"}, ... } everywhere in the editor.
+--- Some component defaults and imported specs use a single hex string, which
+--- the gradient editor cannot read, so it is widened here once.
+local function normalizeColor(value: any): any
+	if type(value) == "string" then
+		return { { 0, value }, { 1, value } }
+	end
+	if type(value) == "table" then
+		if #value == 0 then
+			return { { 0, "#ffffff" }, { 1, "#ffffff" } }
+		end
+		if type(value[1]) == "string" then
+			local points = {}
+			for index, hex in ipairs(value) do
+				points[index] = { (index - 1) / math.max(1, #value - 1), hex }
+			end
+			return points
+		end
+	end
+	return value
+end
+
 --- Fills in any missing field on a custom/imported component so the inspector
 --- can always render it, without discarding values a newer version added.
 function Store.normalizeComponent(comp: any): any
@@ -2897,6 +2919,9 @@ function Store.normalizeComponent(comp: any): any
 		base[key] = value
 	end
 	base.kind = kind
+	if base.color ~= nil then
+		base.color = normalizeColor(base.color)
+	end
 	return base
 end
 
@@ -9449,7 +9474,7 @@ local PARTICLE_FIELDS = {
 	{ key = "shapeStyle", label = "Shape style", type = "enum", enum = "ParticleEmitterShapeStyle" },
 	{ key = "shapeInOut", label = "Shape in/out", type = "enum", enum = "ParticleEmitterShapeInOut" },
 	{ key = "shapePartial", label = "Shape partial", type = "number", min = 0, max = 1, step = 0.01 },
-	{ key = "emissionDirection", label = "Emission dir", type = "enum", enum = "ParticleEmitterEmissionDirection" },
+	{ key = "emissionDirection", label = "Emission dir", type = "enum", enum = "NormalId" },
 	{ key = "orientation", label = "Orientation", type = "enum", enum = "ParticleOrientation" },
 	{ key = "squash", label = "Squash", type = "number", min = 0, max = 1, step = 0.01 },
 	{ key = "zOffset", label = "Z offset", type = "number", min = -20, max = 20, step = 0.1 },
@@ -9594,6 +9619,9 @@ end
 
 local function sorted(points: { any }): { any }
 	local copy = {}
+	if type(points) ~= "table" then
+		return copy
+	end
 	for _, point in ipairs(points) do
 		table.insert(copy, { tonumber(point[1]) or 0, point[2] })
 	end
@@ -11327,6 +11355,14 @@ function Kit.tooltip(object: GuiObject, text: string)
 	if not text or text == "" then
 		return
 	end
+	-- Widgets such as Kit.toggle return an api table, not an instance; a stray
+	-- argument must never take a whole panel down with it.
+	if type(object) ~= "userdata" and type(object) ~= "table" then
+		return
+	end
+	if not (object :: any).IsA then
+		return
+	end
 	local tip: TextLabel? = nil
 	object.MouseEnter:Connect(function()
 		if not overlay or tip then
@@ -11925,7 +11961,7 @@ end
 -- toggle
 --------------------------------------------------------------------------------
 
-function Kit.toggle(parent: Instance, value: boolean, onChange: ((boolean) -> ())?): any
+function Kit.toggle(parent: Instance, value: boolean, onChange: ((boolean) -> ())?, tooltip: string?): any
 	local track = Kit.frame(parent, {
 		Size = UDim2.fromOffset(34, 18),
 		BackgroundColor3 = if value then Theme.color.accent else Theme.color.bg4,
@@ -11972,6 +12008,10 @@ function Kit.toggle(parent: Instance, value: boolean, onChange: ((boolean) -> ()
 
 	function api.Get(): boolean
 		return api.value
+	end
+
+	if tooltip then
+		Kit.tooltip(track, tooltip)
 	end
 
 	return api
@@ -12919,8 +12959,7 @@ function Preview.new(parent: Instance, ctx: any)
 		if value and self.player and not self.player:IsPlaying() then
 			self:play()
 		end
-	end)
-	Kit.tooltip(loopToggle :: any, "Loop the effect")
+	end, "Loop the effect")
 	self.loopToggle = loopToggle
 
 	Kit.label(controls, "Loop", {

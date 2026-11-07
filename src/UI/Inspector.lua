@@ -67,7 +67,7 @@ local PARTICLE_FIELDS = {
 	{ key = "shapeStyle", label = "Shape style", type = "enum", enum = "ParticleEmitterShapeStyle" },
 	{ key = "shapeInOut", label = "Shape in/out", type = "enum", enum = "ParticleEmitterShapeInOut" },
 	{ key = "shapePartial", label = "Shape partial", type = "number", min = 0, max = 1, step = 0.01 },
-	{ key = "emissionDirection", label = "Emission dir", type = "enum", enum = "ParticleEmitterEmissionDirection" },
+	{ key = "emissionDirection", label = "Emission dir", type = "enum", enum = "NormalId" },
 	{ key = "orientation", label = "Orientation", type = "enum", enum = "ParticleOrientation" },
 	{ key = "squash", label = "Squash", type = "number", min = 0, max = 1, step = 0.01 },
 	{ key = "zOffset", label = "Z offset", type = "number", min = -20, max = 20, step = 0.1 },
@@ -212,6 +212,9 @@ end
 
 local function sorted(points: { any }): { any }
 	local copy = {}
+	if type(points) ~= "table" then
+		return copy
+	end
 	for _, point in ipairs(points) do
 		table.insert(copy, { tonumber(point[1]) or 0, point[2] })
 	end

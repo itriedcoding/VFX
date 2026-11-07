@@ -210,6 +210,14 @@ function Kit.tooltip(object: GuiObject, text: string)
 	if not text or text == "" then
 		return
 	end
+	-- Widgets such as Kit.toggle return an api table, not an instance; a stray
+	-- argument must never take a whole panel down with it.
+	if type(object) ~= "userdata" and type(object) ~= "table" then
+		return
+	end
+	if not (object :: any).IsA then
+		return
+	end
 	local tip: TextLabel? = nil
 	object.MouseEnter:Connect(function()
 		if not overlay or tip then
@@ -808,7 +816,7 @@ end
 -- toggle
 --------------------------------------------------------------------------------
 
-function Kit.toggle(parent: Instance, value: boolean, onChange: ((boolean) -> ())?): any
+function Kit.toggle(parent: Instance, value: boolean, onChange: ((boolean) -> ())?, tooltip: string?): any
 	local track = Kit.frame(parent, {
 		Size = UDim2.fromOffset(34, 18),
 		BackgroundColor3 = if value then Theme.color.accent else Theme.color.bg4,
@@ -855,6 +863,10 @@ function Kit.toggle(parent: Instance, value: boolean, onChange: ((boolean) -> ()
 
 	function api.Get(): boolean
 		return api.value
+	end
+
+	if tooltip then
+		Kit.tooltip(track, tooltip)
 	end
 
 	return api

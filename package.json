@@ -10,7 +10,8 @@
     "package": "node tools/package.js",
     "release:check": "node tools/release-check.js",
     "test": "node tools/test.js",
-    "verify": "npm run check && npm run build && npm run test"
+    "verify": "npm run check && npm run build && npm run test",
+    "api:dump": "node tools/api-dump.js"
   },
   "license": "MIT"
 }

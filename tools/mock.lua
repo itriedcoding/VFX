@@ -188,6 +188,12 @@ function CFrame.new(x: any?, y: number?, z: number?): any
 	end
 	return setmetatable({ Position = position, _rotation = { 0, 0, 0 } }, CFrame)
 end
+function CFrame.lookAt(from: any, to: any): any
+	local px, py, pz = from.X or 0, from.Y or 0, from.Z or 0
+	local tx, ty, tz = to.X or 0, to.Y or 0, to.Z or 0
+	return CFrame.new((px + tx) / 2, (py + ty) / 2, (pz + tz) / 2)
+end
+
 function CFrame.Angles(rx: number, ry: number, rz: number): any
 	local frame = CFrame.new(0, 0, 0)
 	frame._rotation = { rx, ry, rz }
@@ -214,6 +220,22 @@ function UDim2.new(xs: number?, xo: number?, ys: number?, yo: number?): any
 	return { X = UDim.new(xs, xo), Y = UDim.new(ys, yo) }
 end
 
+function UDim2.fromScale(xs: number?, ys: number?): any
+	return UDim2.new(xs, 0, ys, 0)
+end
+
+function UDim2.fromOffset(xo: number?, yo: number?): any
+	return UDim2.new(0, xo, 0, yo)
+end
+
+function UDim2.__add(a: any, b: any): any
+	return UDim2.new(a.X.Scale + b.X.Scale, a.X.Offset + b.X.Offset, a.Y.Scale + b.Y.Scale, a.Y.Offset + b.Y.Offset)
+end
+
+function UDim2.__sub(a: any, b: any): any
+	return UDim2.new(a.X.Scale - b.X.Scale, a.X.Offset - b.X.Offset, a.Y.Scale - b.Y.Scale, a.Y.Offset - b.Y.Offset)
+end
+
 TweenInfo = {}
 function TweenInfo.new(...: any): any
 	return { ... }
@@ -232,17 +254,25 @@ local function enumItem(typeName: string, name: string): any
 	return enumItems[key]
 end
 
+local ENUMS = API_ENUMS or {}
+
 local function enumType(typeName: string): any
-	return setmetatable({}, {
-		__index = function(_, key)
-			if key == "GetEnumItems" then
-				return function()
-					return { enumItem(typeName, "Item") }
-				end
-			end
-			return enumItem(typeName, tostring(key))
-		end,
-	})
+	local items = ENUMS[typeName]
+	if not items then
+		error(string.format("Enum.%s does not exist in the Roblox API", tostring(typeName)), 2)
+	end
+	local enumTable = {}
+	for name in pairs(items) do
+		enumTable[name] = enumItem(typeName, name)
+	end
+	enumTable.GetEnumItems = function()
+		local list = {}
+		for name in pairs(items) do
+			table.insert(list, enumItem(typeName, name))
+		end
+		return list
+	end
+	return enumTable
 end
 
 Enum = setmetatable({}, {
@@ -301,6 +331,89 @@ local ALLOWED: { [string]: { [string]: boolean } } = {
 	Folder = {},
 }
 
+-- Class inheritance and property/method surface come from the generated
+-- Roblox API dump (tools/api-props.lua), so a property Studio does not have
+-- fails here instead of failing inside Studio.
+local API = API_PROPS or {}
+
+local function classChain(className: string): { string }
+	local chain = {}
+	local current = className
+	local guard: { [string]: boolean } = {}
+	while current and not guard[current] do
+		guard[current] = true
+		table.insert(chain, current)
+		local info = API[current]
+		current = if info then info.Super else nil
+	end
+	if #chain == 0 then
+		table.insert(chain, className)
+	end
+	table.insert(chain, "Instance")
+	return chain
+end
+
+local function memberAllowed(className: string, group: string, key: string): boolean
+	for _, name in ipairs(classChain(className)) do
+		local info = API[name]
+		if info and info[group] and info[group][key] then
+			return true
+		end
+		local hand = ALLOWED[name]
+		if hand and group == "Props" and hand[key] then
+			return true
+		end
+	end
+	return false
+end
+
+local EVENT_NAMES: { [string]: boolean } = {}
+for _, info in pairs(API) do
+	for name in pairs(info.Events or {}) do
+		EVENT_NAMES[name] = true
+	end
+end
+
+local function describeEventGap(className: string, key: string): string
+	return string.format("mock: %s has no event '%s' (chain: %s)", className, key, table.concat(classChain(className), " -> "))
+end
+
+-- Signals: real Connect/Fire so tests can click the editor's own buttons.
+local function newSignal(): any
+	local handlers = {}
+	local api = {}
+	function api:Connect(callback: (...any) -> ()): any
+		table.insert(handlers, callback)
+		return {
+			Disconnect = function()
+				for index, handler in ipairs(handlers) do
+					if handler == callback then
+						table.remove(handlers, index)
+						break
+					end
+				end
+			end,
+		}
+	end
+	function api:Once(callback: (...any) -> ()): any
+		local connection
+		connection = api:Connect(function(...)
+			connection:Disconnect()
+			callback(...)
+		end)
+		return connection
+	end
+	function api:Wait(): ...any
+		return nil
+	end
+	function api:Fire(...: any)
+		for _, handler in ipairs(table.clone(handlers)) do
+			handler(...)
+		end
+	end
+	return api
+end
+
 local INSTANCE = {}
 
 local functions = {}
@@ -337,9 +450,46 @@ function INSTANCE.__index(self: any, key: string): any
 	if method then
 		return method
 	end
+	-- Any other method the real class exposes exists in Studio; the harness
+	-- answers with a no-op so a panel calling (say) TextBox:CaptureFocus()
+	-- behaves like the engine instead of aborting.
+	if memberAllowed(self.__class, "Methods", key) then
+		return function(...)
+			return nil
+		end
+	end
+	if memberAllowed(self.__class, "Events", key) then
+		self.__events = self.__events or {}
+		if not self.__events[key] then
+			self.__events[key] = newSignal()
+		end
+		return self.__events[key]
+	end
 	local value = self.__props[key]
 	if value ~= nil then
 		return value
+	end
+	-- Measurements and text are set by the layout engine in Studio; the mock
+	-- answers with stable defaults so panels can be laid out headlessly.
+	if key == "AbsoluteSize" or key == "TextBounds" then
+		return Vector2.new(1180, 780)
+	elseif key == "AbsolutePosition" or key == "CanvasPosition" then
+		return Vector2.new(0, 0)
+	elseif key == "Text" or key == "PlaceholderText" or key == "Title" then
+		return ""
+	elseif key == "Visible" or key == "Enabled" or key == "ClipsDescendants" then
+		return true
+	elseif key == "Size" or key == "Position" or key == "CanvasSize" then
+		return UDim2.new(0, 0, 0, 0)
+	elseif key == "AnchorPoint" then
+		return Vector2.new(0, 0)
+	elseif key == "ZIndex" then
+		return 1
+	elseif key == "BackgroundTransparency" or key == "ImageTransparency" or key == "TextTransparency" or key == "Rotation" then
+		return 0
+	end
+	if EVENT_NAMES[key] then
+		error(describeEventGap(self.__class, key), 2)
 	end
 	-- Child lookup, exactly like Roblox: script.Parent.Core.Util.
 	for _, child in ipairs(self.__children) do
@@ -380,35 +530,17 @@ function INSTANCE.__newindex(self: any, key: string, value: any)
 		self.__props.Archivable = value
 		return
 	end
-	local allowed = ALLOWED[self.__class]
-	if not allowed then
+	if not API[self.__class] and not ALLOWED[self.__class] then
 		error(string.format("mock has no property table for class %s (setting %s)", tostring(self.__class), tostring(key)), 2)
 	end
-	if not allowed[key] then
+	if not memberAllowed(self.__class, "Props", key) then
 		error(string.format("%s has no property '%s'", tostring(self.__class), tostring(key)), 2)
 	end
 	self.__props[key] = value
 end
 
-local CLASS_CHAIN: { [string]: { string } } = {
-	Part = { "Part", "BasePart", "PVInstance", "Instance" },
-	MeshPart = { "MeshPart", "BasePart", "PVInstance", "Instance" },
-	Model = { "Model", "PVInstance", "Instance" },
-	Folder = { "Folder", "Instance" },
-	Attachment = { "Attachment", "Instance" },
-	ParticleEmitter = { "ParticleEmitter", "Instance" },
-	Beam = { "Beam", "Instance" },
-	Trail = { "Trail", "Instance" },
-	PointLight = { "PointLight", "Instance" },
-	ModuleScript = { "ModuleScript", "LuaSourceContainer", "Instance" },
-	Script = { "Script", "BaseScript", "LuaSourceContainer", "Instance" },
-	StringValue = { "StringValue", "ValueBase", "Instance" },
-	WorldModel = { "WorldModel", "Instance" },
-}
-
 function functions:IsA(className: string): boolean
-	local chain = CLASS_CHAIN[self.__class] or { self.__class, "Instance" }
-	for _, name in ipairs(chain) do
+	for _, name in ipairs(classChain(self.__class)) do
 		if name == className then
 			return true
 		end
@@ -543,15 +675,8 @@ Instance = { new = newInstance }
 -- services
 --------------------------------------------------------------------------------
 
-local function fakeSignal()
-	return {
-		Connect = function()
-			return { Disconnect = function() end }
-		end,
-		Once = function()
-			return { Disconnect = function() end }
-		end,
-	}
+local function fakeSignal(): any
+	return newSignal()
 end
 
 local jsonEncode
@@ -812,7 +937,26 @@ services.Selection = {
 	end,
 	Set = function() end,
 }
-services.RunService = { Heartbeat = fakeSignal(), RenderStepped = fakeSignal() }
+services.RunService = { Heartbeat = fakeSignal(), RenderStepped = fakeSignal(), PreRender = fakeSignal() }
+services.TextService = {
+	GetTextSize = function(_, text, _size, _font)
+		return Vector2.new(#tostring(text) * 7, 14)
+	end,
+	GetFamily = function()
+		return ""
+	end,
+}
+services.StudioService = {
+	PromptSaveAs = function() end,
+	PromptImportFile = function()
+		return nil
+	end,
+}
+services.GuiService = {
+	GetGuiInset = function()
+		return Vector2.new(0, 0), Vector2.new(0, 0)
+	end,
+}
 services.UserInputService = {
 	InputBegan = fakeSignal(),
 	InputChanged = fakeSignal(),

@@ -164,7 +164,9 @@ tools/
   package.js                zips the model + install notes into dist/VFXStudio.zip
   manifest.js               emits dist/manifest.json for the updater
   check-luau.js             compiles every source file
-  mock.lua + tests.lua      mock Roblox API + the 5,276-check suite
+  mock.lua + tests.lua      API-dump-backed Roblox mock + the 5,306-check suite
+  api-dump.js               regenerates the engine surface from the Roblox API dump
+  api-props.lua             generated classes/properties/events/enums (committed)
   test.js                   bundles src/ + mock.lua + tests.lua and runs them
   live.lua                  drives the real Updater against injected HTTP
   release-check.js          fetches the live release/manifest and asserts the result
@@ -189,6 +191,7 @@ npm run build    # dist/manifest.json + dist/VFXStudio.rbxmx + dist/VFXStudio.zi
 npm run manifest # dist/manifest.json only
 npm run test     # headless verification harness
 npm run verify   # all three
+npm run api:dump # regenerate tools/api-props.lua from the live Roblox API dump
 npm run release:check                                  # what an installed plugin sees right now
 npm run release:check -- --require-release             # must resolve from a GitHub release
 npm run release:check -- --expect-version 1.0.1 --expect-update
@@ -251,15 +254,22 @@ The harness embeds every module into one Luau program and provides a mock Roblox
 - export produces a parented model with controller, README and spec attribute
 - version parsing/comparison handles prereleases; manifests are rejected when they lack folders, use unsafe paths, oversized files or unsupported classes
 - the updater hot-swaps a fake plugin tree, loads the new module, rolls back a build that fails to load, throttles automatic checks, saves a plugin model and reports offline checks as human-readable errors
+- the whole editor is constructed and driven headlessly - library, stage, timeline, inspector,
+  asset/export/update dialogs, playback ticks - so a panel-level crash fails the suite
+- every property write, class name, event and `Enum.*` value is checked against the engine
+  surface generated from the Roblox API dump, not a hand-written whitelist
 - zero engine-level warnings during the entire run
 
-Latest run: `41 Luau files compiled cleanly`, `41 modules / 538.3 KiB manifest`, `324 presets (1001 components) with zero property errors`, `5287 checks passed, 0 failures`.
+Latest run: `41 Luau files compiled cleanly`, `41 modules / 539.4 KiB manifest`, `324 presets (1001 components) with zero property errors`, `5306 checks passed, 0 failures`.
 
 ---
 
 ## Limitations
 
-- **The UI has not been exercised inside Roblox Studio.** It compiles, the editor's data path is fully tested headlessly, and every panel is built from documented APIs — but the final visual/interaction pass (hover states, dock resizing, DPI) needs a human in Studio. Treat the first open as a beta check.
+- **The UI is verified headlessly, not visually.** The suite builds the editor inside the harness and
+  drives every panel, and each property and enum it touches is checked against the Roblox API dump, so a
+  panel can no longer crash on a mistyped API name without failing `npm run test`. What the harness cannot
+  judge is how it *looks* - hover states, dock resizing and DPI still need a human in Studio.
 - Sample marketplace textures must be owned by the experience using them; the asset manager flags failures, and the three `rbxasset://` textures are always safe.
 - `ViewportFrame` rendering is hardware-dependent on very low-end machines; the performance panel estimates particle load rather than measuring frame time.
 - Generated controllers are plain Luau and assume the exported model stays parented where the `require` path says it is.

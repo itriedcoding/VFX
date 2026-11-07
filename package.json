@@ -4,8 +4,9 @@
   "private": true,
   "description": "VFX Studio - a professional Roblox Studio plugin for creating, editing, previewing and managing visual effects.",
   "scripts": {
-    "build": "node tools/build-rbxmx.js",
+    "build": "node tools/manifest.js && node tools/build-rbxmx.js",
     "check": "node tools/check-luau.js",
+    "manifest": "node tools/manifest.js",
     "test": "node tools/test.js",
     "verify": "npm run check && npm run build && npm run test"
   },

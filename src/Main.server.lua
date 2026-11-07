@@ -2,15 +2,10 @@
 	VFX Studio - plugin entry point.
 
 	Creates the toolbar button and the dock widget, then hands control to the
-	App shell. Everything the UI needs is required lazily so a single broken
-	module produces a readable error panel instead of a silently dead toolbar
-	button.
+	App shell. The UI folder is resolved at start time (not captured) so the
+	in-Studio updater can replace Core/Presets/UI and the editor can be rebuilt
+	against the new modules without restarting Studio.
 ]]
-
-local Core = script.Parent.Core
-local UI = script.Parent.UI
-
-local App = require(UI.App)
 
 local TOOLBAR_NAME = "VFX Studio"
 local WIDGET_ID = "VFXStudioMain"
@@ -40,6 +35,11 @@ widget.Enabled = false
 local app = nil
 
 local function showFatalError(message: string)
+	pcall(function()
+		for _, child in ipairs(widget:GetChildren()) do
+			child:Destroy()
+		end
+	end)
 	local frame = Instance.new("Frame")
 	frame.Size = UDim2.fromScale(1, 1)
 	frame.BackgroundColor3 = Color3.fromRGB(9, 11, 16)
@@ -71,11 +71,46 @@ local function showFatalError(message: string)
 	body.Parent = frame
 end
 
+-- Re-resolved on every (re)start so a hot update is picked up.
+local function resolveUI(): Instance?
+	return script.Parent and script.Parent:FindFirstChild("UI")
+end
+
+local buildApp
+
+local function restart()
+	if app then
+		local ok = pcall(function()
+			app:destroy()
+		end)
+		if not ok then
+			warn("[VFX Studio] previous editor failed to shut down cleanly")
+		end
+		app = nil
+	end
+	local ok, result = pcall(buildApp)
+	if ok then
+		app = result
+	else
+		warn("[VFX Studio] rebuild after update failed: " .. tostring(result))
+		showFatalError("The updated editor failed to start.\n\n" .. tostring(result) .. "\n\nReplace the plugin file with the previous version, or open the Output window for the traceback.")
+	end
+end
+
+buildApp = function()
+	local ui = resolveUI()
+	if not ui then
+		error("the UI folder is missing from the plugin")
+	end
+	local App = require(ui.App)
+	return App.new(plugin, widget, script.Parent, restart)
+end
+
 local function ensureApp(): boolean
 	if app then
 		return true
 	end
-	local ok, result = pcall(App.new, plugin, widget)
+	local ok, result = pcall(buildApp)
 	if not ok then
 		warn("[VFX Studio] startup failed: " .. tostring(result))
 		showFatalError(tostring(result) .. "\n\nOpen the Output window for the full traceback.")

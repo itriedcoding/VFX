@@ -20,6 +20,9 @@ local Timeline = require(script.Parent.Timeline)
 local Inspector = require(script.Parent.Inspector)
 local AssetsPanel = require(script.Parent.AssetsPanel)
 local ExportDialog = require(script.Parent.ExportDialog)
+local UpdateDialog = require(script.Parent.UpdateDialog)
+local Version = require(script.Parent.Parent.Core.Version)
+local Updater = require(script.Parent.Parent.Core.Updater)
 
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -35,10 +38,12 @@ local MAX_LEFT = 400
 local MIN_RIGHT = 280
 local MAX_RIGHT = 440
 
-function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
+function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui, pluginRoot: Instance?, onRestart: (() -> ())?)
 	local self = setmetatable({}, App)
 	self.plugin = pluginInstance
 	self.widget = widget
+	self.pluginRoot = pluginRoot or script.Parent.Parent
+	self.onRestart = onRestart
 	self.connections = {}
 	self.leftEnabled = true
 	self.rightEnabled = true
@@ -49,6 +54,7 @@ function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
 	Assets.setCustom(store:getPref("customAssets", {}))
 	store.prefs.background = store:getPref("background", "studio")
 	self.store = store
+	self.updater = Updater.new(pluginInstance, self.pluginRoot)
 
 	Kit.setOverlay(nil)
 
@@ -104,6 +110,11 @@ function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
 		end,
 	}
 	self.ctx = ctx
+	ctx.updater = self.updater
+	ctx.onUpdated = onRestart
+	ctx.openUpdates = function()
+		self:openUpdateDialog()
+	end
 
 	-- Top bar -----------------------------------------------------------------
 	local topBar = Kit.frame(root, {
@@ -213,6 +224,17 @@ function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
 			self:openExportDialog()
 		end,
 	})
+	self.versionButton = Kit.button(rightGroup, Version.display(Version.VERSION), {
+		variant = "secondary",
+		height = 28,
+		size = UDim2.fromOffset(58, 28),
+		textSize = Theme.text.tiny,
+		tooltip = "Installed version - check for updates",
+		onClick = function()
+			self:openUpdateDialog()
+		end,
+	})
+	self.versionButton.TextColor3 = Theme.color.textDim
 
 	-- Panels ------------------------------------------------------------------
 	local leftPanel = Kit.frame(root, {
@@ -405,6 +427,7 @@ function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
 	self:updateStatus()
 	self:startHeartbeat()
 	store:scheduleSave()
+	self:scheduleUpdateCheck()
 	return self
 end
 
@@ -656,6 +679,42 @@ function App:openExportDialog()
 	self.modalContent = dialog
 end
 
+function App:openUpdateDialog()
+	local card = self:openModal(560, 620)
+	local dialog = UpdateDialog.new(card, self.ctx)
+	self.modalContent = dialog
+end
+
+function App:updateVersionChip(hasUpdate: boolean)
+	if not self.versionButton then
+		return
+	end
+	local display = Version.display(Version.VERSION)
+	self.versionButton.Text = if hasUpdate then display .. "  \u{2191}" else display
+	self.versionButton.TextColor3 = if hasUpdate then Theme.color.accentBright else Theme.color.textDim
+end
+
+function App:scheduleUpdateCheck()
+	if not self.updater then
+		return
+	end
+	task.delay(4, function()
+		if not self.root.Parent or not self.updater:shouldAutoCheck() then
+			return
+		end
+		local ok, info = pcall(function()
+			return self.updater:check()
+		end)
+		if not ok or not self.root.Parent then
+			return
+		end
+		if info and self.updater:hasUpdate() then
+			self:updateVersionChip(true)
+			self:toast("VFX Studio " .. Version.display(info.version) .. " is available - open the version button to update", "info")
+		end
+	end)
+end
+
 function App:promptSavePreset()
 	local card = self:openModal(380, 216)
 	local store = self.store
@@ -763,6 +822,11 @@ function App:reloadPreset()
 end
 
 function App:destroy()
+	if self.updater then
+		pcall(function()
+			self.updater:destroy()
+		end)
+	end
 	for _, connection in ipairs(self.connections) do
 		pcall(function()
 			connection:Disconnect()

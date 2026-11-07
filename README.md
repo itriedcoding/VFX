@@ -46,6 +46,19 @@ Keyboard: `Space` play/pause, `R` restart, `Del` remove the selected component, 
 
 ---
 
+## Updates, synced with releases
+
+VFX Studio updates itself from GitHub without leaving Studio. The version chip in the top bar (for example `v1.0.0`) opens the update panel; it turns blue with an arrow when a newer build exists.
+
+- **Automatic checks** run once every six hours on startup (toggleable). Results are cached, so reopening Studio does not spam GitHub.
+- **Check for updates** reads the latest GitHub release, shows the tag, publication source and release notes. Before the first tagged release exists it falls back to the manifest published from `main`, so the flow works from day one.
+- **Update now** downloads `manifest.json` from the release, validates it strictly (version, file count, total size, per-file size, allowed classes, safe paths, required folders), then hot-swaps the running plugin's `Core`, `Presets` and `UI` modules and rebuilds the editor against them — no Studio restart. The new build is loaded and verified before the old folders are deleted; any failure rolls the swap back and leaves the previous version running.
+- **Save plugin file** opens Studio's own save dialog with the rebuilt model and the suggested name `VFXStudio.rbxmx`. Studio has no API that writes plugin files, so this is the one manual step to make the update survive a restart: choose your Plugins folder and overwrite the old file.
+
+Studio asks for HTTP permission the first time the plugin contacts `github.com`. Nothing else is sent anywhere: the updater only reads the release and manifest URLs in [`src/Core/Version.lua`](src/Core/Version.lua), with no telemetry or identifiers. `HttpEnabled` does not need to be enabled — plugin HTTP permissions are separate.
+
+---
+
 ## The preset library
 
 324 presets, 14 categories, 355 tags, 1001 components in total.
@@ -121,6 +134,7 @@ src/
   Core/
     Util, Theme, Format    helpers, design tokens, datatype conversion
     Signals, History       event bus, spec undo stack + Studio recordings
+    Version, Updater       release endpoints, update check, manifest, hot swap
     Assets                  texture catalogue + validation
     Compiler                spec -> instances, and live reconcile
     Player                  timeline runtime used by the preview
@@ -136,11 +150,15 @@ src/
   UI/
     Kit                     widget toolkit (sliders, dropdowns, toggles, drag)
     App                     shell, layout, resizers, toasts, modals, shortcuts
-    Library, Preview, Timeline, Inspector, AssetsPanel, ExportDialog
+    Library, Preview, Timeline, Inspector, AssetsPanel, ExportDialog,
+    UpdateDialog            in-Studio updater UI
 tools/
   build-rbxmx.js            packs src/ into dist/VFXStudio.rbxmx
+  manifest.js               emits dist/manifest.json for the updater
   check-luau.js             compiles every source file
   test.js + harness.lua     headless mock-Roblox test suite
+.github/workflows/release.yml
+                            builds, verifies and attaches both release assets
 ```
 
 Design notes:
@@ -156,14 +174,30 @@ Design notes:
 
 ```bash
 npm run check    # luau-compile every file in src/
-npm run build    # dist/VFXStudio.rbxmx
+npm run build    # dist/manifest.json + dist/VFXStudio.rbxmx
+npm run manifest # dist/manifest.json only
 npm run test     # headless verification harness
 npm run verify   # all three
 ```
 
+### Publishing a release
+
+1. Bump the version in **both** `package.json` and `src/Core/Version.lua` (`manifest.js` refuses to build when they disagree).
+2. `npm run verify` locally.
+3. Commit, then tag and push:
+
+```bash
+npm version patch --no-git-tag-version
+# update Version.VERSION to the same number, commit
+git tag v1.0.1
+git push origin main --tags
+```
+
+The `Release` workflow installs Luau, runs `npm run verify`, checks that the tag matches `Version.lua`, and publishes a GitHub release with `VFXStudio.rbxmx` and `manifest.json` attached. That release is what every installed plugin sees on its next update check.
+
 `check` and `test` look for `luau` / `luau-compile` on `PATH`, then `/tmp/luau`, then `tools/bin`. Point `LUAU_BIN` at the folder containing them to override. Binaries: [luau-lang/luau releases](https://github.com/luau-lang/luau/releases) (`luau-ubuntu.zip`).
 
-The harness embeds every module into one Luau program and provides a mock Roblox API whose instances **reject writes to properties that do not exist on that class** — the check that keeps the compiler honest. It verifies 5,231 assertions:
+The harness embeds every module into one Luau program and provides a mock Roblox API whose instances **reject writes to properties that do not exist on that class** — the check that keeps the compiler honest. It verifies 5,276 assertions:
 
 - 324 presets load with zero validation errors, unique ids, unique names, non-empty tags and descriptions
 - every preset compiles to the expected instance count and round-trips through the `VFXSpec` attribute
@@ -171,9 +205,11 @@ The harness embeds every module into one Luau program and provides a mock Roblox
 - 24 effects decompile from raw properties and recompile
 - performance scores are in range; store undo/redo, favourites, custom presets and JSON persistence survive a reload
 - export produces a parented model with controller, README and spec attribute
+- version parsing/comparison handles prereleases; manifests are rejected when they lack folders, use unsafe paths, oversized files or unsupported classes
+- the updater hot-swaps a fake plugin tree, loads the new module, rolls back a build that fails to load, throttles automatic checks, saves a plugin model and reports offline checks as human-readable errors
 - zero engine-level warnings during the entire run
 
-Latest run: `38 Luau files compiled cleanly`, `324 presets (1001 components) with zero property errors`, `5231 checks passed, 0 failures`.
+Latest run: `41 Luau files compiled cleanly`, `41 modules / 535.6 KiB manifest`, `324 presets (1001 components) with zero property errors`, `5276 checks passed, 0 failures`.
 
 ---
 

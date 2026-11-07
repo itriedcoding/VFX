@@ -3552,6 +3552,536 @@ return Theme
 			</Item>
 			<Item class="ModuleScript" referent="RBX14">
 				<Properties>
+					<string name="Name">Updater</string>
+					<bool name="Archivable">true</bool>
+					<ProtectedString name="Source"><![CDATA[--[[
+	Updater - release-synced self-update, entirely inside Roblox Studio.
+
+	Flow:
+	  1. Ask GitHub for the latest release (falls back to the manifest on the
+	     main branch before the first release exists).
+	  2. Download `manifest.json`, which carries every module's real source.
+	  3. Validate it hard (sizes, classes, paths, top-level folders).
+	  4. Hot-swap the running plugin's Core/Presets/UI folders for freshly
+	     created ModuleScripts and verify the new App module loads. On any
+	     failure the previous folders are restored untouched.
+	  5. Offer "Save plugin file" so the update survives a Studio restart:
+	     Studio has no API for writing plugin files, so this selects the rebuilt
+	     model and opens Studio's own save dialog.
+
+	Studio allows plugin HTTP per-domain; the user is prompted once for
+	api.github.com / github.com / raw.githubusercontent.com. HttpEnabled is
+	irrelevant to plugins.
+]]
+
+local HttpService = game:GetService("HttpService")
+local ServerStorage = game:GetService("ServerStorage")
+local Selection = game:GetService("Selection")
+
+local Version = require(script.Parent.Version)
+local Format = require(script.Parent.Format)
+local Signals = require(script.Parent.Signals)
+
+local Updater = {}
+Updater.__index = Updater
+
+local SETTING_KEY = "VFXStudio.update.v2"
+local CONTAINER_FOLDER = "VFXStudio"
+
+function Updater.new(pluginInstance: Plugin, root: Instance?)
+	local self = setmetatable({
+		plugin = pluginInstance,
+		root = root,
+		signals = Signals.new(),
+		state = "idle",
+		info = nil,
+		lastError = nil,
+		appliedManifest = nil,
+		appliedVersion = nil,
+		tempHolder = nil,
+		cache = {},
+	}, Updater)
+	self:loadCache()
+	return self
+end
+
+--------------------------------------------------------------------------------
+-- state + cache
+--------------------------------------------------------------------------------
+
+function Updater:setState(state: string, message: string?)
+	self.state = state
+	self.stateMessage = message
+	self.lastError = if state == "error" then message else nil
+	self.signals:fire("state", { state = state, message = message })
+end
+
+function Updater:loadCache()
+	local raw = self.plugin and self.plugin:GetSetting(SETTING_KEY)
+	local decoded = Format.jsonDecode(if type(raw) == "string" then raw else nil)
+	if type(decoded) == "table" then
+		self.cache = decoded
+	end
+end
+
+function Updater:saveCache()
+	local encoded = Format.jsonEncode(self.cache)
+	if not encoded or not self.plugin then
+		return
+	end
+	pcall(function()
+		self.plugin:SetSetting(SETTING_KEY, encoded)
+	end)
+end
+
+function Updater:isAutoCheckEnabled(): boolean
+	return self.cache.autoCheck ~= false
+end
+
+function Updater:setAutoCheck(enabled: boolean)
+	self.cache.autoCheck = enabled == true
+	self:saveCache()
+	self.signals:fire("state", { state = self.state, message = self.stateMessage })
+end
+
+function Updater:shouldAutoCheck(): boolean
+	if not self:isAutoCheckEnabled() then
+		return false
+	end
+	local last = tonumber(self.cache.checkedAt) or 0
+	return (os.time() - last) >= Version.MIN_CHECK_INTERVAL
+end
+
+function Updater:markChecked(version: string)
+	self.cache.checkedAt = os.time()
+	self.cache.latest = version
+	self.cache.installed = Version.VERSION
+	self:saveCache()
+end
+
+function Updater:installedVersion(): string
+	return self.appliedVersion or Version.VERSION
+end
+
+function Updater:hasUpdate(): boolean
+	return self.info ~= nil and Version.isNewer(self.info.version, self:installedVersion())
+end
+
+--------------------------------------------------------------------------------
+-- http
+--------------------------------------------------------------------------------
+
+function Updater.explainHttpError(message: string): string
+	local lower = string.lower(message)
+	if string.find(lower, "not enabled", 1, true) or string.find(lower, "http requests are not", 1, true) then
+		return "Studio blocked web requests for this plugin. Open Plugins → Manage Plugins, allow HTTP access for github.com, then retry."
+	elseif string.find(lower, "permission", 1, true) or string.find(lower, "denied", 1, true) or string.find(lower, "not permitted", 1, true) then
+		return "Studio denied this plugin's web access. Allow it under Plugins → Manage Plugins, then press Check again."
+	elseif string.find(lower, "timeout", 1, true) or string.find(lower, "timed out", 1, true) then
+		return "GitHub did not respond in time. Check your connection and retry."
+	elseif string.find(lower, "not allowed to access", 1, true) then
+		return "Studio blocked that domain for plugins. Allow it in Plugin Management and retry."
+	end
+	return message
+end
+
+--- Returns (body, nil) or (nil, message). `notfound` is returned for 404.
+function Updater:httpGet(url: string, accept: string?): (string?, string?)
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = url,
+			Method = "GET",
+			Headers = {
+				["User-Agent"] = "VFX-Studio/" .. Version.VERSION,
+				["Accept"] = accept or "application/json",
+			},
+			Timeout = Version.HTTP_TIMEOUT,
+		})
+	end)
+	if not ok then
+		return nil, Updater.explainHttpError(tostring(response))
+	end
+	if type(response) ~= "table" then
+		return nil, "Studio returned no response for " .. url
+	end
+	if not response.Success then
+		local status = tonumber(response.StatusCode) or 0
+		if status == 404 then
+			return nil, "notfound"
+		elseif status == 403 then
+			return nil, "GitHub rate limit reached (60 checks/hour). Try again later."
+		elseif status == 0 then
+			return nil, "Could not reach GitHub. Check your connection and plugin HTTP permissions."
+		end
+		return nil, string.format("GitHub returned HTTP %d for %s", status, url)
+	end
+	return response.Body or "", nil
+end
+
+--------------------------------------------------------------------------------
+-- manifest validation / construction
+--------------------------------------------------------------------------------
+
+local function splitPath(value: string): { string }
+	local list = {}
+	for part in string.gmatch(value .. "/", "(.-)/") do
+		table.insert(list, part)
+	end
+	return list
+end
+
+local function safeNodeName(value: any): boolean
+	if type(value) ~= "string" or value == "" or #value > 80 then
+		return false
+	end
+	if string.find(value, "[%c]") then
+		return false
+	end
+	if string.find(value, "%.%.") or string.find(value, "[/\\]") then
+		return false
+	end
+	return true
+end
+
+--- Hard validation of a downloaded manifest. Returns (true) or (false, message).
+function Updater.validateManifest(manifest: any): (boolean, string?)
+	if type(manifest) ~= "table" then
+		return false, "The manifest is not a JSON object."
+	end
+	if type(manifest.version) ~= "string" or Version.parse(manifest.version) == nil then
+		return false, "The manifest has no valid version."
+	end
+	if type(manifest.files) ~= "table" then
+		return false, "The manifest has no file list."
+	end
+	local count = #manifest.files
+	if count < 1 or count > Version.MAX_FILES then
+		return false, string.format("The manifest lists %d files (expected 1-%d).", count, Version.MAX_FILES)
+	end
+
+	local total = 0
+	local roots: { [string]: boolean } = {}
+	for _, file in ipairs(manifest.files) do
+		if type(file) ~= "table" then
+			return false, "A manifest entry is not an object."
+		end
+		if type(file.path) ~= "string" or file.path == "" or string.find(file.path, "..", 1, true) then
+			return false, "A manifest entry has an unsafe path."
+		end
+		if file.class ~= "ModuleScript" and file.class ~= "Script" then
+			return false, "Unsupported class '" .. tostring(file.class) .. "' in " .. file.path
+		end
+		if not safeNodeName(file.name) then
+			return false, "Unsafe instance name in " .. file.path
+		end
+		if type(file.source) ~= "string" then
+			return false, "Missing source for " .. file.path
+		end
+		local size = #file.source
+		if size > Version.MAX_SOURCE_BYTES then
+			return false, "File too large: " .. file.path
+		end
+		total += size
+		local segments = splitPath(file.path)
+		if #segments < 1 then
+			return false, "Path is empty: " .. file.path
+		end
+		roots[segments[1]] = true
+	end
+
+	if total > Version.MAX_TOTAL_BYTES then
+		return false, string.format("The manifest is too large (%.1f MB).", total / (1024 * 1024))
+	end
+	for _, required in ipairs({ "Core", "Presets", "UI" }) do
+		if not roots[required] then
+			return false, "The manifest is missing the " .. required .. " folder."
+		end
+	end
+	return true, nil
+end
+
+--- Builds a detached Folder tree from a validated manifest.
+function Updater.buildTree(manifest: any): Folder
+	local root = Instance.new("Folder")
+	root.Name = CONTAINER_FOLDER
+
+	local folders: { [string]: Folder } = {}
+	local function folderAt(segments: { string }): Folder
+		local parent = root
+		local key = ""
+		for _, segment in ipairs(segments) do
+			key = key .. "/" .. segment
+			local existing = folders[key]
+			if not existing then
+				existing = Instance.new("Folder")
+				existing.Name = segment
+				existing.Parent = parent
+				folders[key] = existing
+			end
+			parent = existing
+		end
+		return parent
+	end
+
+	for _, file in ipairs(manifest.files) do
+		local segments = splitPath(file.path)
+		table.remove(segments)
+		local parent = folderAt(segments)
+		local instance = Instance.new(file.class)
+		instance.Name = file.name
+		instance.Source = file.source
+		instance.Parent = parent
+	end
+	return root
+end
+
+--------------------------------------------------------------------------------
+-- checking
+--------------------------------------------------------------------------------
+
+local function releaseNotes(value: any): string
+	if type(value) ~= "string" then
+		return ""
+	end
+	local trimmed = string.gsub(value, "%s+$", "")
+	if #trimmed > 4000 then
+		trimmed = string.sub(trimmed, 1, 4000) .. "\n\n..."
+	end
+	return trimmed
+end
+
+local function manifestAssetUrl(release: any): string?
+	if type(release.assets) ~= "table" then
+		return nil
+	end
+	for _, asset in ipairs(release.assets) do
+		if type(asset) == "table" and asset.name == Version.MANIFEST_ASSET and type(asset.browser_download_url) == "string" then
+			return asset.browser_download_url
+		end
+	end
+	return nil
+end
+
+--- Checks for a newer build. Yields while requesting. Returns the release info.
+function Updater:check(): any?
+	if self.state == "checking" or self.state == "downloading" or self.state == "applying" then
+		return self.info
+	end
+	self:setState("checking", "Contacting GitHub...")
+
+	local body, err = self:httpGet(Version.API_URL, "application/vnd.github+json")
+	if body then
+		local release = Format.jsonDecode(body)
+		if type(release) == "table" and (release.tag_name or release.name) then
+			local version = Version.clean(release.tag_name or release.name)
+			if Version.parse(version) then
+				self.info = {
+					version = version,
+					notes = releaseNotes(release.body),
+					url = if type(release.html_url) == "string" then release.html_url else Version.RELEASES_URL,
+					publishedAt = release.published_at,
+					manifestUrl = manifestAssetUrl(release) or Version.MANIFEST_URL,
+					source = "release",
+				}
+				self:markChecked(version)
+				self:setState("idle", nil)
+				return self.info
+			end
+			err = "The latest release tag is not a version number."
+		else
+			err = "GitHub returned an unexpected release payload."
+		end
+	end
+
+	-- No releases yet (or the API is blocked): fall back to the manifest that
+	-- is published from the main branch.
+	self:setState("checking", "No release found - checking the main branch manifest...")
+	local fallbackBody, fallbackErr = self:httpGet(Version.FALLBACK_MANIFEST_URL)
+	if fallbackBody then
+		local manifest = Format.jsonDecode(fallbackBody)
+		local valid, problem = Updater.validateManifest(manifest)
+		if valid then
+			self.info = {
+				version = Version.clean(manifest.version),
+				notes = "Build from the main branch (no tagged release yet).",
+				url = Version.RELEASES_URL,
+				publishedAt = manifest.generatedAt,
+				manifestUrl = Version.FALLBACK_MANIFEST_URL,
+				source = "main",
+			}
+			self:markChecked(self.info.version)
+			self:setState("idle", nil)
+			return self.info
+		end
+		self:setState("error", problem)
+		return nil
+	end
+
+	local message = err
+	if message == nil or message == "notfound" then
+		message = "No published builds yet. Tag a commit with v" .. Version.VERSION .. " to publish one."
+	end
+	if fallbackErr and fallbackErr ~= "notfound" then
+		message = tostring(message) .. "\n" .. tostring(fallbackErr)
+	end
+	self:setState("error", message)
+	return nil
+end
+
+--------------------------------------------------------------------------------
+-- applying
+--------------------------------------------------------------------------------
+
+function Updater:downloadManifest(url: string?): (any?, string?)
+	local target = url or (self.info and self.info.manifestUrl)
+	if not target then
+		return nil, "Check for updates first."
+	end
+	self:setState("downloading", "Downloading the new build...")
+	local body, err = self:httpGet(target)
+	if not body then
+		self:setState("error", err or "Download failed.")
+		return nil, err
+	end
+	local manifest = Format.jsonDecode(body)
+	local valid, problem = Updater.validateManifest(manifest)
+	if not valid then
+		self:setState("error", problem)
+		return nil, problem
+	end
+	if not Version.isNewer(manifest.version, self:installedVersion()) then
+		local message = string.format("The downloaded build (v%s) is not newer than v%s.", Version.clean(manifest.version), self:installedVersion())
+		self:setState("error", message)
+		return nil, message
+	end
+	self:setState("downloading", "Downloaded v" .. Version.clean(manifest.version) .. ".")
+	return manifest, nil
+end
+
+--- Swaps the running plugin's folders for the downloaded sources.
+function Updater:apply(manifest: any): (boolean, string?)
+	if not self.root then
+		return false, "The plugin root folder is unavailable."
+	end
+	self:setState("applying", "Installing v" .. Version.clean(manifest.version) .. "...")
+
+	local preview = Updater.buildTree(manifest)
+	local swapped = {}
+
+	local function rollback()
+		for _, item in ipairs(swapped) do
+			pcall(function()
+				item.new:Destroy()
+			end)
+			item.old.Name = item.name
+		end
+		if preview.Parent == nil then
+			preview:Destroy()
+		end
+	end
+
+	for _, name in ipairs({ "Core", "Presets", "UI" }) do
+		local newFolder = preview:FindFirstChild(name)
+		local oldFolder = self.root:FindFirstChild(name)
+		if not newFolder then
+			rollback()
+			return false, "The build is missing the " .. name .. " folder."
+		end
+		if not oldFolder then
+			rollback()
+			return false, "The installed plugin is missing the " .. name .. " folder."
+		end
+		oldFolder.Name = name .. "__previous"
+		newFolder.Name = name
+		newFolder.Parent = self.root
+		table.insert(swapped, { old = oldFolder, new = newFolder, name = name })
+	end
+
+	-- Verify the new build actually loads before deleting the old one.
+	local ok, err = pcall(function()
+		local ui = self.root:FindFirstChild("UI")
+		return require(ui.App)
+	end)
+	if not ok then
+		rollback()
+		local message = "The new build failed to load: " .. tostring(err)
+		self:setState("error", message)
+		return false, message
+	end
+
+	for _, item in ipairs(swapped) do
+		item.old:Destroy()
+	end
+	preview:Destroy()
+
+	self.appliedManifest = manifest
+	self.appliedVersion = Version.clean(manifest.version)
+	self:setState("ready", "Updated to v" .. self.appliedVersion .. ".")
+	return true, nil
+end
+
+--------------------------------------------------------------------------------
+-- persistence
+--------------------------------------------------------------------------------
+
+--- Rebuilds the model and opens Studio's save dialog. Studio has no API that
+--- writes plugin files directly, so this is the only persistence path.
+function Updater:saveToDisk(manifest: any): (boolean, string?)
+	local target = manifest or self.appliedManifest
+	if not target then
+		return false, "Update first, or check for updates."
+	end
+	if self.tempHolder then
+		self:cleanupTemp()
+	end
+
+	local tree = Updater.buildTree(target)
+	local holder = Instance.new("Folder")
+	holder.Name = "VFXStudio Update (delete after saving)"
+	tree.Parent = holder
+	holder.Parent = ServerStorage
+	self.tempHolder = holder
+
+	local previous = Selection:Get()
+	Selection:Set({ tree })
+
+	local ok, err = pcall(function()
+		if self.plugin and self.plugin.PromptSaveSelection then
+			self.plugin:PromptSaveSelection(Version.MODEL_ASSET)
+		elseif self.plugin and self.plugin.SaveSelectedToFile then
+			self.plugin:SaveSelectedToFile(Version.MODEL_ASSET)
+		else
+			error("this Studio build has no save-selection API")
+		end
+	end)
+	Selection:Set(previous)
+
+	if not ok then
+		return false, tostring(err)
+	end
+	return true, nil
+end
+
+function Updater:cleanupTemp()
+	if self.tempHolder then
+		pcall(function()
+			self.tempHolder:Destroy()
+		end)
+		self.tempHolder = nil
+	end
+end
+
+function Updater:destroy()
+	self:cleanupTemp()
+	self.signals:clear()
+end
+
+return Updater
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX15">
+				<Properties>
 					<string name="Name">Util</string>
 					<bool name="Archivable">true</bool>
 					<ProtectedString name="Source"><![CDATA[--!strict
@@ -3813,8 +4343,113 @@ return Util
 ]]></ProtectedString>
 				</Properties>
 			</Item>
+			<Item class="ModuleScript" referent="RBX16">
+				<Properties>
+					<string name="Name">Version</string>
+					<bool name="Archivable">true</bool>
+					<ProtectedString name="Source"><![CDATA[--[[
+	Version - the single source of truth for the plugin version and the
+	release endpoints the updater talks to.
+
+	`VERSION` must match package.json; tools/manifest.js fails the build when
+	the two disagree, so a release can never ship a stale version number.
+]]
+
+local Version = {}
+
+Version.VERSION = "1.0.0"
+
+Version.REPO = "itriedcoding/VFX"
+Version.RELEASES_URL = "https://github.com/itriedcoding/VFX/releases"
+Version.API_URL = "https://api.github.com/repos/itriedcoding/VFX/releases/latest"
+
+-- Stable URL that always points at the newest published release.
+Version.MANIFEST_URL = "https://github.com/itriedcoding/VFX/releases/latest/download/manifest.json"
+Version.MODEL_URL = "https://github.com/itriedcoding/VFX/releases/latest/download/VFXStudio.rbxmx"
+
+-- Fallback used until the first GitHub release exists (and as a canary for
+-- builds that have landed on main but have not been tagged yet).
+Version.FALLBACK_MANIFEST_URL = "https://raw.githubusercontent.com/itriedcoding/VFX/main/dist/manifest.json"
+
+Version.MANIFEST_ASSET = "manifest.json"
+Version.MODEL_ASSET = "VFXStudio.rbxmx"
+Version.MIN_CHECK_INTERVAL = 6 * 60 * 60
+Version.HTTP_TIMEOUT = 20
+
+Version.MAX_FILES = 400
+Version.MAX_TOTAL_BYTES = 8 * 1024 * 1024
+Version.MAX_SOURCE_BYTES = 512 * 1024
+
+function Version.clean(value: any): string
+	local text = tostring(value or "")
+	text = string.gsub(text, "^%s*[vV]%s*", "")
+	return (string.gsub(text, "%s+$", ""))
+end
+
+--- Parses "1.2.3", "v1.2.3" or "1.2.3-beta.1" into comparable parts.
+function Version.parse(value: any): any?
+	local text = Version.clean(value)
+	if text == "" then
+		return nil
+	end
+	local major, minor, patch, prerelease = string.match(text, "^(%d+)%.(%d+)%.(%d+)%-?([%w%.%-]*)$")
+	if not major then
+		major, minor, patch = string.match(text, "^(%d+)%.(%d+)$")
+		patch = patch or "0"
+		prerelease = ""
+	end
+	if not major or not minor then
+		return nil
+	end
+	return {
+		major = tonumber(major) or 0,
+		minor = tonumber(minor) or 0,
+		patch = tonumber(patch) or 0,
+		prerelease = if prerelease ~= nil and prerelease ~= "" then prerelease else nil,
+		raw = text,
+	}
+end
+
+--- Returns -1, 0 or 1. A prerelease sorts below its final release.
+function Version.compare(a: any, b: any): number
+	local left = Version.parse(a)
+	local right = Version.parse(b)
+	if not left or not right then
+		return 0
+	end
+	for _, key in ipairs({ "major", "minor", "patch" }) do
+		if left[key] ~= right[key] then
+			return if left[key] > right[key] then 1 else -1
+		end
+	end
+	if left.prerelease and not right.prerelease then
+		return -1
+	elseif right.prerelease and not left.prerelease then
+		return 1
+	elseif left.prerelease and right.prerelease then
+		if left.prerelease == right.prerelease then
+			return 0
+		end
+		return if left.prerelease > right.prerelease then 1 else -1
+	end
+	return 0
+end
+
+function Version.isNewer(candidate: any, current: any?): boolean
+	return Version.compare(candidate, current or Version.VERSION) > 0
+end
+
+function Version.display(value: any?): string
+	local text = Version.clean(value or Version.VERSION)
+	return "v" .. text
+end
+
+return Version
+]]></ProtectedString>
+				</Properties>
+			</Item>
 		</Item>
-		<Item class="Script" referent="RBX15">
+		<Item class="Script" referent="RBX17">
 			<Properties>
 				<string name="Name">Main</string>
 				<bool name="Archivable">true</bool>
@@ -3822,15 +4457,10 @@ return Util
 	VFX Studio - plugin entry point.
 
 	Creates the toolbar button and the dock widget, then hands control to the
-	App shell. Everything the UI needs is required lazily so a single broken
-	module produces a readable error panel instead of a silently dead toolbar
-	button.
+	App shell. The UI folder is resolved at start time (not captured) so the
+	in-Studio updater can replace Core/Presets/UI and the editor can be rebuilt
+	against the new modules without restarting Studio.
 ]]
-
-local Core = script.Parent.Core
-local UI = script.Parent.UI
-
-local App = require(UI.App)
 
 local TOOLBAR_NAME = "VFX Studio"
 local WIDGET_ID = "VFXStudioMain"
@@ -3860,6 +4490,11 @@ widget.Enabled = false
 local app = nil
 
 local function showFatalError(message: string)
+	pcall(function()
+		for _, child in ipairs(widget:GetChildren()) do
+			child:Destroy()
+		end
+	end)
 	local frame = Instance.new("Frame")
 	frame.Size = UDim2.fromScale(1, 1)
 	frame.BackgroundColor3 = Color3.fromRGB(9, 11, 16)
@@ -3891,11 +4526,46 @@ local function showFatalError(message: string)
 	body.Parent = frame
 end
 
+-- Re-resolved on every (re)start so a hot update is picked up.
+local function resolveUI(): Instance?
+	return script.Parent and script.Parent:FindFirstChild("UI")
+end
+
+local buildApp
+
+local function restart()
+	if app then
+		local ok = pcall(function()
+			app:destroy()
+		end)
+		if not ok then
+			warn("[VFX Studio] previous editor failed to shut down cleanly")
+		end
+		app = nil
+	end
+	local ok, result = pcall(buildApp)
+	if ok then
+		app = result
+	else
+		warn("[VFX Studio] rebuild after update failed: " .. tostring(result))
+		showFatalError("The updated editor failed to start.\n\n" .. tostring(result) .. "\n\nReplace the plugin file with the previous version, or open the Output window for the traceback.")
+	end
+end
+
+buildApp = function()
+	local ui = resolveUI()
+	if not ui then
+		error("the UI folder is missing from the plugin")
+	end
+	local App = require(ui.App)
+	return App.new(plugin, widget, script.Parent, restart)
+end
+
 local function ensureApp(): boolean
 	if app then
 		return true
 	end
-	local ok, result = pcall(App.new, plugin, widget)
+	local ok, result = pcall(buildApp)
 	if not ok then
 		warn("[VFX Studio] startup failed: " .. tostring(result))
 		showFatalError(tostring(result) .. "\n\nOpen the Output window for the full traceback.")
@@ -3943,7 +4613,7 @@ warn("[VFX Studio] loaded. Click the VFX Studio button in the Plugins tab to ope
 				<token name="RunContext">0</token>
 			</Properties>
 		</Item>
-		<Item class="ModuleScript" referent="RBX16">
+		<Item class="ModuleScript" referent="RBX18">
 			<Properties>
 				<string name="Name">Presets</string>
 				<bool name="Archivable">true</bool>
@@ -4283,7 +4953,7 @@ end
 return Presets
 ]]></ProtectedString>
 			</Properties>
-			<Item class="ModuleScript" referent="RBX17">
+			<Item class="ModuleScript" referent="RBX19">
 				<Properties>
 					<string name="Name">Auras</string>
 					<bool name="Archivable">true</bool>
@@ -4456,7 +5126,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX18">
+			<Item class="ModuleScript" referent="RBX20">
 				<Properties>
 					<string name="Name">DSL</string>
 					<bool name="Archivable">true</bool>
@@ -4939,7 +5609,7 @@ return DSL
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX19">
+			<Item class="ModuleScript" referent="RBX21">
 				<Properties>
 					<string name="Name">Energy</string>
 					<bool name="Archivable">true</bool>
@@ -5121,7 +5791,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX20">
+			<Item class="ModuleScript" referent="RBX22">
 				<Properties>
 					<string name="Name">Environmental</string>
 					<bool name="Archivable">true</bool>
@@ -5263,7 +5933,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX21">
+			<Item class="ModuleScript" referent="RBX23">
 				<Properties>
 					<string name="Name">Explosions</string>
 					<bool name="Archivable">true</bool>
@@ -5448,7 +6118,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX22">
+			<Item class="ModuleScript" referent="RBX24">
 				<Properties>
 					<string name="Name">Fire</string>
 					<bool name="Archivable">true</bool>
@@ -5616,7 +6286,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX23">
+			<Item class="ModuleScript" referent="RBX25">
 				<Properties>
 					<string name="Name">Impacts</string>
 					<bool name="Archivable">true</bool>
@@ -5767,7 +6437,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX24">
+			<Item class="ModuleScript" referent="RBX26">
 				<Properties>
 					<string name="Name">Lightning</string>
 					<bool name="Archivable">true</bool>
@@ -5941,7 +6611,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX25">
+			<Item class="ModuleScript" referent="RBX27">
 				<Properties>
 					<string name="Name">Magic</string>
 					<bool name="Archivable">true</bool>
@@ -6124,7 +6794,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX26">
+			<Item class="ModuleScript" referent="RBX28">
 				<Properties>
 					<string name="Name">Particles</string>
 					<bool name="Archivable">true</bool>
@@ -6250,7 +6920,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX27">
+			<Item class="ModuleScript" referent="RBX29">
 				<Properties>
 					<string name="Name">Portals</string>
 					<bool name="Archivable">true</bool>
@@ -6426,7 +7096,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX28">
+			<Item class="ModuleScript" referent="RBX30">
 				<Properties>
 					<string name="Name">Smoke</string>
 					<bool name="Archivable">true</bool>
@@ -6556,7 +7226,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX29">
+			<Item class="ModuleScript" referent="RBX31">
 				<Properties>
 					<string name="Name">Trails</string>
 					<bool name="Archivable">true</bool>
@@ -6763,7 +7433,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX30">
+			<Item class="ModuleScript" referent="RBX32">
 				<Properties>
 					<string name="Name">Weapons</string>
 					<bool name="Archivable">true</bool>
@@ -6928,7 +7598,7 @@ return {
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX31">
+			<Item class="ModuleScript" referent="RBX33">
 				<Properties>
 					<string name="Name">Weather</string>
 					<bool name="Archivable">true</bool>
@@ -7066,12 +7736,12 @@ return {
 				</Properties>
 			</Item>
 		</Item>
-		<Item class="Folder" referent="RBX32">
+		<Item class="Folder" referent="RBX34">
 			<Properties>
 				<string name="Name">UI</string>
 				<bool name="Archivable">true</bool>
 			</Properties>
-			<Item class="ModuleScript" referent="RBX33">
+			<Item class="ModuleScript" referent="RBX35">
 				<Properties>
 					<string name="Name">App</string>
 					<bool name="Archivable">true</bool>
@@ -7097,6 +7767,9 @@ local Timeline = require(script.Parent.Timeline)
 local Inspector = require(script.Parent.Inspector)
 local AssetsPanel = require(script.Parent.AssetsPanel)
 local ExportDialog = require(script.Parent.ExportDialog)
+local UpdateDialog = require(script.Parent.UpdateDialog)
+local Version = require(script.Parent.Parent.Core.Version)
+local Updater = require(script.Parent.Parent.Core.Updater)
 
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -7112,10 +7785,12 @@ local MAX_LEFT = 400
 local MIN_RIGHT = 280
 local MAX_RIGHT = 440
 
-function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
+function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui, pluginRoot: Instance?, onRestart: (() -> ())?)
 	local self = setmetatable({}, App)
 	self.plugin = pluginInstance
 	self.widget = widget
+	self.pluginRoot = pluginRoot or script.Parent.Parent
+	self.onRestart = onRestart
 	self.connections = {}
 	self.leftEnabled = true
 	self.rightEnabled = true
@@ -7126,6 +7801,7 @@ function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
 	Assets.setCustom(store:getPref("customAssets", {}))
 	store.prefs.background = store:getPref("background", "studio")
 	self.store = store
+	self.updater = Updater.new(pluginInstance, self.pluginRoot)
 
 	Kit.setOverlay(nil)
 
@@ -7181,6 +7857,11 @@ function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
 		end,
 	}
 	self.ctx = ctx
+	ctx.updater = self.updater
+	ctx.onUpdated = onRestart
+	ctx.openUpdates = function()
+		self:openUpdateDialog()
+	end
 
 	-- Top bar -----------------------------------------------------------------
 	local topBar = Kit.frame(root, {
@@ -7290,6 +7971,17 @@ function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
 			self:openExportDialog()
 		end,
 	})
+	self.versionButton = Kit.button(rightGroup, Version.display(Version.VERSION), {
+		variant = "secondary",
+		height = 28,
+		size = UDim2.fromOffset(58, 28),
+		textSize = Theme.text.tiny,
+		tooltip = "Installed version - check for updates",
+		onClick = function()
+			self:openUpdateDialog()
+		end,
+	})
+	self.versionButton.TextColor3 = Theme.color.textDim
 
 	-- Panels ------------------------------------------------------------------
 	local leftPanel = Kit.frame(root, {
@@ -7482,6 +8174,7 @@ function App.new(pluginInstance: Plugin, widget: DockWidgetPluginGui)
 	self:updateStatus()
 	self:startHeartbeat()
 	store:scheduleSave()
+	self:scheduleUpdateCheck()
 	return self
 end
 
@@ -7733,6 +8426,42 @@ function App:openExportDialog()
 	self.modalContent = dialog
 end
 
+function App:openUpdateDialog()
+	local card = self:openModal(560, 620)
+	local dialog = UpdateDialog.new(card, self.ctx)
+	self.modalContent = dialog
+end
+
+function App:updateVersionChip(hasUpdate: boolean)
+	if not self.versionButton then
+		return
+	end
+	local display = Version.display(Version.VERSION)
+	self.versionButton.Text = if hasUpdate then display .. "  \u{2191}" else display
+	self.versionButton.TextColor3 = if hasUpdate then Theme.color.accentBright else Theme.color.textDim
+end
+
+function App:scheduleUpdateCheck()
+	if not self.updater then
+		return
+	end
+	task.delay(4, function()
+		if not self.root.Parent or not self.updater:shouldAutoCheck() then
+			return
+		end
+		local ok, info = pcall(function()
+			return self.updater:check()
+		end)
+		if not ok or not self.root.Parent then
+			return
+		end
+		if info and self.updater:hasUpdate() then
+			self:updateVersionChip(true)
+			self:toast("VFX Studio " .. Version.display(info.version) .. " is available - open the version button to update", "info")
+		end
+	end)
+end
+
 function App:promptSavePreset()
 	local card = self:openModal(380, 216)
 	local store = self.store
@@ -7840,6 +8569,11 @@ function App:reloadPreset()
 end
 
 function App:destroy()
+	if self.updater then
+		pcall(function()
+			self.updater:destroy()
+		end)
+	end
 	for _, connection in ipairs(self.connections) do
 		pcall(function()
 			connection:Disconnect()
@@ -7873,7 +8607,7 @@ return App
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX34">
+			<Item class="ModuleScript" referent="RBX36">
 				<Properties>
 					<string name="Name">AssetsPanel</string>
 					<bool name="Archivable">true</bool>
@@ -8328,7 +9062,7 @@ return AssetsPanel
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX35">
+			<Item class="ModuleScript" referent="RBX37">
 				<Properties>
 					<string name="Name">ExportDialog</string>
 					<bool name="Archivable">true</bool>
@@ -8604,7 +9338,7 @@ return ExportDialog
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX36">
+			<Item class="ModuleScript" referent="RBX38">
 				<Properties>
 					<string name="Name">Inspector</string>
 					<bool name="Archivable">true</bool>
@@ -10339,7 +11073,7 @@ return Inspector
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX37">
+			<Item class="ModuleScript" referent="RBX39">
 				<Properties>
 					<string name="Name">Kit</string>
 					<bool name="Archivable">true</bool>
@@ -11412,7 +12146,7 @@ return Kit
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX38">
+			<Item class="ModuleScript" referent="RBX40">
 				<Properties>
 					<string name="Name">Library</string>
 					<bool name="Archivable">true</bool>
@@ -11861,7 +12595,7 @@ return Library
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX39">
+			<Item class="ModuleScript" referent="RBX41">
 				<Properties>
 					<string name="Name">Preview</string>
 					<bool name="Archivable">true</bool>
@@ -12538,7 +13272,7 @@ return Preview
 ]]></ProtectedString>
 				</Properties>
 			</Item>
-			<Item class="ModuleScript" referent="RBX40">
+			<Item class="ModuleScript" referent="RBX42">
 				<Properties>
 					<string name="Name">Timeline</string>
 					<bool name="Archivable">true</bool>
@@ -13043,6 +13777,352 @@ function Timeline:destroy()
 end
 
 return Timeline
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX43">
+				<Properties>
+					<string name="Name">UpdateDialog</string>
+					<bool name="Archivable">true</bool>
+					<ProtectedString name="Source"><![CDATA[--[[
+	UpdateDialog - release-synced updates, inside Studio.
+
+	Shows the installed version, checks GitHub, applies a downloaded build to the
+	running plugin without a restart, and offers the save-to-disk step that makes
+	the update survive a Studio restart.
+]]
+
+local Util = require(script.Parent.Parent.Core.Util)
+local Theme = require(script.Parent.Parent.Core.Theme)
+local Version = require(script.Parent.Parent.Core.Version)
+local Kit = require(script.Parent.Kit)
+
+local UpdateDialog = {}
+UpdateDialog.__index = UpdateDialog
+
+function UpdateDialog.new(parent: Instance, ctx: any)
+	local self = setmetatable({}, UpdateDialog)
+	self.ctx = ctx
+	self.updater = ctx.updater
+	self.connections = {}
+
+	local root = Kit.frame(parent, {
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundColor3 = Theme.color.bg1,
+	})
+	self.root = root
+
+	local header = Kit.frame(root, {
+		Size = UDim2.new(1, 0, 0, 52),
+		BackgroundTransparency = 1,
+		ClipsDescendants = false,
+	})
+	Kit.label(header, "Updates", {
+		Position = UDim2.fromOffset(16, 10),
+		Size = UDim2.new(1, -70, 0, 20),
+		Font = Theme.font.bold,
+		TextSize = Theme.text.title,
+	})
+	Kit.caption(header, "Synced with GitHub releases for " .. Version.REPO, {
+		Position = UDim2.fromOffset(16, 30),
+		Size = UDim2.new(1, -70, 0, 14),
+		TextSize = Theme.text.tiny,
+	})
+	local close = Kit.iconButton(header, "\u{00d7}", {
+		size = UDim2.fromOffset(26, 26),
+		tooltip = "Close",
+		onClick = function()
+			ctx.closeModal()
+		end,
+	})
+	close.Position = UDim2.new(1, -38, 0, 12)
+
+	local body = Kit.vlist(root, 10, {
+		Size = UDim2.new(1, -32, 0, 0),
+		Position = UDim2.fromOffset(16, 58),
+	})
+	body.AutomaticSize = Enum.AutomaticSize.Y
+
+	-- Version card -------------------------------------------------------------
+	local card = Kit.frame(body, {
+		Size = UDim2.new(1, 0, 0, 72),
+		BackgroundColor3 = Theme.color.bg2,
+	})
+	Theme.corner(card, Theme.radius.md)
+
+	self.installedLabel = Kit.label(card, "Installed  " .. Version.display(Version.VERSION), {
+		Position = UDim2.fromOffset(12, 8),
+		Size = UDim2.new(1, -24, 0, 16),
+		TextSize = Theme.text.small,
+		Font = Theme.font.medium,
+	})
+	self.latestLabel = Kit.caption(card, "Latest  -", {
+		Position = UDim2.fromOffset(12, 26),
+		Size = UDim2.new(1, -24, 0, 14),
+		TextSize = Theme.text.tiny,
+	})
+	self.stateLabel = Kit.label(card, "Ready.", {
+		Position = UDim2.fromOffset(12, 44),
+		Size = UDim2.new(1, -24, 0, 16),
+		TextColor3 = Theme.color.textMuted,
+		TextSize = Theme.text.tiny,
+		TextWrapped = true,
+	})
+
+	-- Actions ------------------------------------------------------------------
+	local actions = Kit.hlist(body, 8, {
+		Size = UDim2.new(1, 0, 0, 30),
+	})
+	actions.AutomaticSize = Enum.AutomaticSize.None
+	actions.Size = UDim2.new(1, 0, 0, 30)
+
+	self.checkButton = Kit.button(actions, "Check for updates", {
+		variant = "secondary",
+		height = 30,
+		size = UDim2.fromOffset(136, 30),
+		onClick = function()
+			self:check()
+		end,
+	})
+	self.updateButton = Kit.button(actions, "Update now", {
+		variant = "primary",
+		height = 30,
+		size = UDim2.fromOffset(104, 30),
+		onClick = function()
+			self:update()
+		end,
+	})
+	self.saveButton = Kit.button(actions, "Save plugin file", {
+		variant = "ghost",
+		height = 30,
+		size = UDim2.fromOffset(112, 30),
+		tooltip = "Save the updated plugin model so it survives a Studio restart",
+		onClick = function()
+			self:save()
+		end,
+	})
+
+	-- Auto-check ---------------------------------------------------------------
+	local autoRow = Kit.hlist(body, 8, {
+		Size = UDim2.new(1, 0, 0, 22),
+	})
+	autoRow.AutomaticSize = Enum.AutomaticSize.None
+	autoRow.Size = UDim2.new(1, 0, 0, 22)
+	local autoToggle = Kit.toggle(autoRow, self.updater:isAutoCheckEnabled(), function(value)
+		self.updater:setAutoCheck(value)
+		self:refresh()
+	end)
+	autoToggle.Parent = autoRow
+	Kit.caption(autoRow, "Check for updates when Studio opens", {
+		Size = UDim2.new(1, -44, 0, 22),
+		TextSize = Theme.text.tiny,
+	})
+
+	-- Notes --------------------------------------------------------------------
+	Kit.caption(body, "RELEASE NOTES", {
+		Size = UDim2.new(1, 0, 0, 14),
+		Font = Theme.font.bold,
+		TextSize = Theme.text.tiny,
+		TextColor3 = Theme.color.textMuted,
+	})
+
+	local notesCard = Kit.frame(body, {
+		Size = UDim2.new(1, 0, 0, 132),
+		BackgroundColor3 = Theme.color.bg0,
+	})
+	Theme.corner(notesCard, Theme.radius.sm)
+	self.notesBox = Kit.textBox(notesCard, "", {
+		size = UDim2.new(1, -16, 1, -16),
+		font = Theme.font.mono,
+		textSize = 10,
+	})
+	self.notesBox.Position = UDim2.fromOffset(8, 8)
+	self.notesBox.TextWrapped = true
+	self.notesBox.TextYAlignment = Enum.TextYAlignment.Top
+	self.notesBox.TextXAlignment = Enum.TextXAlignment.Left
+	self.notesBox.Text = "Press \"Check for updates\" to fetch the latest build notes."
+
+	-- Release link -------------------------------------------------------------
+	Kit.caption(body, "RELEASES", {
+		Size = UDim2.new(1, 0, 0, 14),
+		Font = Theme.font.bold,
+		TextSize = Theme.text.tiny,
+		TextColor3 = Theme.color.textMuted,
+	})
+	local linkBox = Kit.textBox(body, Version.RELEASES_URL, {
+		size = UDim2.new(1, 0, 0, 26),
+		font = Theme.font.mono,
+		textSize = Theme.text.tiny,
+	})
+	linkBox.TextEditable = true
+
+	Kit.caption(body, "After updating, press \"Save plugin file\", choose VFXStudio.rbxmx in your Plugins folder and overwrite it. Studio has no API that writes plugin files directly, so this is the one manual step.", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		TextSize = Theme.text.tiny,
+		TextColor3 = Theme.color.textMuted,
+	})
+
+	-- Footer -------------------------------------------------------------------
+	local footer = Kit.hlist(root, 8, {
+		Size = UDim2.new(1, -32, 0, 32),
+		Position = UDim2.new(0, 16, 1, -44),
+	})
+	footer.AutomaticSize = Enum.AutomaticSize.None
+	footer.Size = UDim2.new(1, -32, 0, 32)
+
+	self.closeButton = Kit.button(footer, "Done", {
+		variant = "accentSoft",
+		height = 32,
+		size = UDim2.fromOffset(84, 32),
+		onClick = function()
+			ctx.closeModal()
+		end,
+	})
+	self.hintLabel = Kit.caption(footer, "", {
+		Size = UDim2.new(1, -96, 0, 32),
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextSize = Theme.text.tiny,
+		TextWrapped = true,
+	})
+
+	table.insert(self.connections, self.updater.signals:on("state", function()
+		self:refresh()
+	end))
+
+	self:refresh()
+	return self
+end
+
+function UpdateDialog:refresh()
+	if not self.root.Parent then
+		return
+	end
+	local updater = self.updater
+	local installed = Version.display(updater:installedVersion())
+	self.installedLabel.Text = "Installed  " .. installed
+
+	local info = updater.info
+	if info then
+		local newer = updater:hasUpdate()
+		self.latestLabel.Text = string.format(
+			"Latest  %s  (%s)",
+			Version.display(info.version),
+			if info.source == "release" then "GitHub release" else "main branch"
+		)
+		self.latestLabel.TextColor3 = if newer then Theme.color.accentBright else Theme.color.textMuted
+		self.notesBox.Text = if info.notes ~= "" then info.notes else "No release notes."
+		self.updateButton.Text = if newer then "Update to " .. Version.display(info.version) else "Up to date"
+		self.updateButton.TextColor3 = if newer then Theme.color.white else Theme.color.textDim
+		self.updateButton.BackgroundColor3 = if newer then Theme.color.accent else Theme.color.bg3
+	else
+		self.latestLabel.Text = "Latest  -"
+		self.updateButton.Text = "Update now"
+	end
+
+	local busy = updater.state == "checking" or updater.state == "downloading" or updater.state == "applying"
+	self.checkButton.Text = if updater.state == "checking" then "Checking..." else "Check for updates"
+	self.checkButton.TextColor3 = if busy then Theme.color.textFaint else Theme.color.text
+
+	local message = updater.stateMessage
+	if updater.state == "error" then
+		self.stateLabel.Text = "Error: " .. tostring(updater.lastError)
+		self.stateLabel.TextColor3 = Theme.color.bad
+		self.notesBox.Text = tostring(updater.lastError)
+	elseif updater.state == "ready" then
+		self.stateLabel.Text = "Updated in this Studio session. Save the plugin file to keep it."
+		self.stateLabel.TextColor3 = Theme.color.good
+	elseif busy then
+		self.stateLabel.Text = message or "Working..."
+		self.stateLabel.TextColor3 = Theme.color.accentBright
+	else
+		self.stateLabel.Text = if message then message else "Ready."
+		self.stateLabel.TextColor3 = Theme.color.textMuted
+	end
+
+	self.hintLabel.Text = if updater.appliedManifest
+		then "Running v" .. Version.clean(updater.appliedVersion or Version.VERSION) .. " from this update."
+		else ""
+end
+
+function UpdateDialog:check()
+	if self.updater.state == "checking" or self.updater.state == "downloading" then
+		return
+	end
+	task.spawn(function()
+		local ok, info = pcall(function()
+			return self.updater:check()
+		end)
+		if not ok then
+			self.ctx.toast("Update check failed", "error")
+			self:refresh()
+			return
+		end
+		self:refresh()
+		if info then
+			if self.updater:hasUpdate() then
+				self.ctx.toast(string.format("v%s is available", Version.clean(info.version)), "info")
+			else
+				self.ctx.toast("You are on the latest version", "success")
+			end
+		else
+			self.ctx.toast(self.updater.lastError or "Could not check for updates", "warn")
+		end
+	end)
+end
+
+function UpdateDialog:update()
+	if self.updater.state == "downloading" or self.updater.state == "applying" then
+		return
+	end
+	task.spawn(function()
+		local manifest, err = self.updater:downloadManifest()
+		if not manifest then
+			self.ctx.toast(err or "Download failed", "error")
+			self:refresh()
+			return
+		end
+		local ok, applyError = self.updater:apply(manifest)
+		if not ok then
+			self.ctx.toast(applyError or "Update failed", "error")
+			self:refresh()
+			return
+		end
+		self.ctx.toast("Updated to v" .. Version.clean(manifest.version) .. " in this session", "success")
+		self:refresh()
+		-- Rebuild the editor against the new modules.
+		if self.ctx.onUpdated then
+			task.defer(function()
+				local callback = self.ctx.onUpdated
+				if callback then
+					callback()
+				end
+			end)
+		end
+	end)
+end
+
+function UpdateDialog:save()
+	local ok, err = self.updater:saveToDisk()
+	if not ok then
+		self.ctx.toast(err or "Could not open the save dialog", "error")
+		return
+	end
+	self.ctx.toast("Choose your Plugins folder and overwrite VFXStudio.rbxmx", "info")
+	self.hintLabel.Text = "Save dialog opened. Overwrite VFXStudio.rbxmx, then restart Studio."
+end
+
+function UpdateDialog:destroy()
+	for _, connection in ipairs(self.connections) do
+		pcall(function()
+			connection:disconnect()
+		end)
+	end
+	self.root:Destroy()
+end
+
+return UpdateDialog
 ]]></ProtectedString>
 				</Properties>
 			</Item>

@@ -296,6 +296,7 @@ local ALLOWED: { [string]: { [string]: boolean } } = {
 	},
 	PointLight = { Color = true, Brightness = true, Range = true, Shadows = true, Enabled = true },
 	ModuleScript = { Source = true },
+	Script = { Source = true, Disabled = true },
 	StringValue = { Value = true },
 	Folder = {},
 }
@@ -400,6 +401,7 @@ local CLASS_CHAIN: { [string]: { string } } = {
 	Trail = { "Trail", "Instance" },
 	PointLight = { "PointLight", "Instance" },
 	ModuleScript = { "ModuleScript", "LuaSourceContainer", "Instance" },
+	Script = { "Script", "BaseScript", "LuaSourceContainer", "Instance" },
 	StringValue = { "StringValue", "ValueBase", "Instance" },
 	WorldModel = { "WorldModel", "Instance" },
 }
@@ -740,12 +742,23 @@ local function jsonDecode(text: string): any
 	return result
 end
 
+MOCK_HTTP = { responses = {}, requests = {} }
+MOCK_JSON_ENCODE = jsonEncode
+
 local HttpService = {
 	JSONEncode = function(_, value)
 		return jsonEncode(value)
 	end,
 	JSONDecode = function(_, text)
 		return jsonDecode(text)
+	end,
+	RequestAsync = function(_, request)
+		table.insert(MOCK_HTTP.requests, request)
+		local response = MOCK_HTTP.responses[request.Url]
+		if response then
+			return response
+		end
+		return { Success = false, StatusCode = 404, Body = "" }
 	end,
 }
 
@@ -903,6 +916,14 @@ local function loadModule(node: any): any
 		error("circular require: " .. tostring(functions.GetFullName(node)))
 	end
 	local source = SOURCES[node]
+	if not source then
+		-- Modules created at runtime (by the updater) carry their source directly.
+		local inline = node.Source
+		if type(inline) == "string" then
+			source = inline
+			SOURCES[node] = inline
+		end
+	end
 	if not source then
 		error("no source registered for " .. tostring(functions.GetFullName(node)))
 	end
@@ -1157,6 +1178,158 @@ for _, name in ipairs({ "Core.Util", "Core.Format", "Core.Compiler", "Core.Perfo
 		node = nextNode
 	end
 end
+
+section("version")
+local Version = require(root.Core.Version)
+checkEqual(Version.compare("1.0.0", "1.0.0"), 0, "equal versions compare equal")
+checkEqual(Version.compare("1.2.0", "1.1.9"), 1, "higher minor is newer")
+checkEqual(Version.compare("1.0.0", "1.0.1"), -1, "lower patch is older")
+checkEqual(Version.compare("1.0.0-beta.1", "1.0.0"), -1, "prerelease sorts below its release")
+checkEqual(Version.clean("v2.3.4"), "2.3.4", "clean strips a leading v")
+check(Version.isNewer("1.0.1", "1.0.0"), "1.0.1 is newer than 1.0.0")
+check(not Version.isNewer("1.0.0", "1.0.0"), "equal versions are not newer")
+check(Version.parse("not-a-version") == nil, "garbage does not parse")
+print("  " .. Version.display(Version.VERSION) .. " parses, compares and formats correctly")
+
+section("updater")
+local Updater = require(root.Core.Updater)
+
+local function stubFile(path: string, name: string, source: string): any
+	return { path = path, name = name, class = "ModuleScript", source = source }
+end
+
+local manifest = {
+	version = "1.0.1",
+	files = {
+		stubFile("Core/Version", "Version", "return { VERSION = '1.0.1' }"),
+		stubFile("Presets/init", "Presets", "return { count = 0 }"),
+		stubFile("UI/App", "App", "return { stub = true, version = '1.0.1' }"),
+		{ path = "Main.server", name = "Main", class = "Script", source = "return nil" },
+	},
+}
+
+local valid, problem = Updater.validateManifest(manifest)
+check(valid, "a well-formed manifest validates: " .. tostring(problem))
+
+local missingUI = { version = "1.0.1", files = { stubFile("Core/Version", "Version", "return {}"), stubFile("Presets/init", "Presets", "return {}") } }
+check(not Updater.validateManifest(missingUI), "a manifest without the UI folder is rejected")
+
+local badClass = {
+	version = "1.0.1",
+	files = {
+		stubFile("Core/Version", "Version", "return {}"),
+		stubFile("Presets/init", "Presets", "return {}"),
+		{ path = "UI/App", name = "App", class = "LocalScript", source = "" },
+	},
+}
+check(not Updater.validateManifest(badClass), "LocalScripts are rejected")
+
+local traversal = {
+	version = "1.0.1",
+	files = {
+		stubFile("Core/Version", "Version", "return {}"),
+		stubFile("Presets/init", "Presets", "return {}"),
+		stubFile("UI/App", "App", "return {}"),
+		stubFile("UI/../../evil", "evil", "return {}"),
+	},
+}
+check(not Updater.validateManifest(traversal), "path traversal is rejected")
+
+local tree = Updater.buildTree(manifest)
+checkEqual(tree.Name, "VFXStudio", "built tree root name")
+check(tree:FindFirstChild("Core"):FindFirstChild("Version") ~= nil, "built tree contains Core.Version")
+check(tree:FindFirstChild("UI"):FindFirstChild("App") ~= nil, "built tree contains UI.App")
+check(tree:FindFirstChild("Main") ~= nil, "built tree contains the Main script")
+check(tree:FindFirstChild("Presets"):FindFirstChild("DSL") == nil, "built tree has no stray modules")
+tree:Destroy()
+
+local pluginSettings = {}
+local fakeUpdatePlugin = {
+	GetSetting = function(_, key)
+		return pluginSettings[key]
+	end,
+	SetSetting = function(_, key, value)
+		pluginSettings[key] = value
+	end,
+	PromptSaveSelection = function() end,
+}
+
+local pluginRoot = makeNode("VFXStudio", "Folder", nil)
+local oldCore = makeNode("Core", "Folder", pluginRoot)
+makeNode("Util", "ModuleScript", oldCore).Source = "return { old = true }"
+local oldPresets = makeNode("Presets", "Folder", pluginRoot)
+makeNode("Presets", "ModuleScript", oldPresets).Source = "return {}"
+local oldUI = makeNode("UI", "Folder", pluginRoot)
+makeNode("App", "ModuleScript", oldUI).Source = "return { stub = true, version = '1.0.0' }"
+
+local updater = Updater.new(fakeUpdatePlugin, pluginRoot)
+checkEqual(updater:installedVersion(), Version.VERSION, "installed version starts at the build version")
+check(updater:hasUpdate() == false, "no update before a check")
+
+local appliedOk, applyError = updater:apply(manifest)
+check(appliedOk, "apply failed: " .. tostring(applyError))
+check(pluginRoot:FindFirstChild("Core"):FindFirstChild("Version") ~= nil, "Core folder was swapped")
+check(pluginRoot:FindFirstChild("UI"):FindFirstChild("App") ~= nil, "UI folder was swapped")
+check(require(pluginRoot.UI.App).stub == true, "the new App module loads")
+checkEqual(updater.appliedVersion, "1.0.1", "applied version is recorded")
+check(pluginRoot:FindFirstChild("Core__previous") == nil, "old folders are removed after a good update")
+
+local broken = {
+	version = "1.0.2",
+	files = {
+		stubFile("Core/Version", "Version", "return {}"),
+		stubFile("Presets/init", "Presets", "return {}"),
+		stubFile("UI/App", "App", "error('boom')"),
+	},
+}
+local brokenOk, brokenError = updater:apply(broken)
+check(not brokenOk, "a build that fails to load must not apply")
+check(string.find(tostring(brokenError), "failed to load", 1, true) ~= nil, "the failure explains itself")
+checkEqual(pluginRoot:FindFirstChild("UI").Name, "UI", "UI folder restored after rollback")
+check(pluginRoot:FindFirstChild("UI__previous") == nil, "no half-swapped folders remain")
+checkEqual(require(pluginRoot.UI.App).version, "1.0.1", "the previous build still loads")
+
+MOCK_HTTP.responses[Version.API_URL] = {
+	Success = true,
+	StatusCode = 200,
+	Body = MOCK_JSON_ENCODE({
+		tag_name = "v1.0.1",
+		body = "Fixed things.",
+		html_url = "https://example.com/release",
+		assets = { { name = "manifest.json", browser_download_url = "https://example.com/manifest.json" } },
+	}),
+}
+local info = updater:check()
+check(info ~= nil, "check returns release info")
+checkEqual(info.version, "1.0.1", "check reads the release tag")
+checkEqual(info.manifestUrl, "https://example.com/manifest.json", "check finds the manifest asset")
+check(updater:hasUpdate() == false, "the applied version is not offered again")
+check(not updater:shouldAutoCheck(), "automatic checks are throttled after one check")
+
+MOCK_HTTP.responses["https://example.com/manifest.json"] = { Success = true, StatusCode = 200, Body = MOCK_JSON_ENCODE(manifest) }
+local downloaded, downloadError = updater:downloadManifest()
+check(downloaded == nil, "a manifest that is not newer is rejected")
+check(type(downloadError) == "string", "the rejection explains itself")
+
+local throttled = Updater.new(fakeUpdatePlugin, pluginRoot)
+check(not throttled:shouldAutoCheck(), "a reopened editor honours the check cache")
+throttled:setAutoCheck(false)
+check(not throttled:shouldAutoCheck(), "auto check can be disabled")
+throttled:setAutoCheck(true)
+
+local savedOk, savedError = updater:saveToDisk(manifest)
+check(savedOk, "saveToDisk failed: " .. tostring(savedError))
+check(updater.tempHolder ~= nil, "saveToDisk builds a temporary model")
+updater:cleanupTemp()
+check(updater.tempHolder == nil, "the temporary model is cleaned up")
+
+MOCK_HTTP.responses = {}
+local offline = Updater.new(fakeUpdatePlugin, pluginRoot)
+local offlineInfo = offline:check()
+check(offlineInfo == nil, "an offline check returns nothing")
+checkEqual(offline.state, "error", "an offline check reports an error state")
+check(type(offline.lastError) == "string" and #offline.lastError > 10, "the offline error is human readable")
+print("  manifest validation, hot swap, rollback, save and offline handling verified")
 
 section("warnings")
 checkEqual(#warnings, 0, "engine warnings: " .. table.concat(warnings, " | "))

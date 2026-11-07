@@ -44,10 +44,11 @@ const ORDER = [
   "Core/Compiler",
   "Core/Performance",
   "Core/Decompiler",
-  "Core/ScriptGenerator",
-  "Core/Exporter",
-  "Core/Player",
-  "Core/Store",
+  "Core/ScriptGenerator",	"Core/Exporter",
+	"Core/Player",
+	"Core/Store",
+	"Core/Version",
+	"Core/Updater",
 ];
 
 function findInterpreter() {
